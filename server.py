@@ -4,8 +4,11 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 import uuid
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from aiohttp import web
@@ -21,24 +24,103 @@ logging.basicConfig(
 )
 log = logging.getLogger("serotonin-mcp")
 
-HTTP_HOST         = os.environ.get("SEROTONIN_HTTP_HOST", "127.0.0.1")
-HTTP_PORT         = int(os.environ.get("SEROTONIN_HTTP_PORT", "8765"))
-POLL_HOLD_SECONDS = 9.0
-DEFAULT_TIMEOUT   = 30.0
+HTTP_HOST          = "127.0.0.1"
+HTTP_PORT          = 8765
+POLL_HOLD_SECONDS  = 9.0
+DEFAULT_TIMEOUT    = 10.0
+
+BLACKLIST_PATH = Path(__file__).with_name("crash_blacklist.json")
+
+DEFAULT_BLACKLIST: dict[str, Any] = {
+    "version": 1,
+    "paths": [
+        "game.DataModel", "game.PlaceID", "game.GetFFlag", "game.SetFFlag",
+    ],
+    "dive_depth_limits": [
+        {"prefix": "game.Workspace.Live.", "max_depth": 1,
+         "reason": "Motor6D/Humanoid chain crashes deep dive"},
+    ],
+    "eval_code_blocked": [
+        r"game\s*\.\s*DataModel",
+        r"game\s*\.\s*PlaceID",
+        r"game\s*\.\s*GetFFlag",
+        r"game\s*\.\s*SetFFlag",
+        r":GetFFlag\s*\(",
+        r":SetFFlag\s*\(",
+    ],
+    "history": [],
+}
+
+SAFE_MODE: bool = True
+BL:        dict[str, Any] = {}
+
+def load_blacklist() -> dict[str, Any]:
+    if not BLACKLIST_PATH.exists():
+        BLACKLIST_PATH.write_text(json.dumps(DEFAULT_BLACKLIST, indent=4))
+        return dict(DEFAULT_BLACKLIST)
+    try:
+        data = json.loads(BLACKLIST_PATH.read_text(encoding="utf-8"))
+
+        for k, v in DEFAULT_BLACKLIST.items():
+            data.setdefault(k, v)
+        return data
+    except Exception as e:
+        log.warning("blacklist load failed (%s), using defaults", e)
+        return dict(DEFAULT_BLACKLIST)
+
+def save_blacklist() -> None:
+    try:
+        BLACKLIST_PATH.write_text(json.dumps(BL, indent=4, ensure_ascii=False))
+    except Exception as e:
+        log.warning("blacklist save failed: %s", e)
+
+def check_request_safe(op: str, args: dict) -> tuple[bool, str | None]:
+    args = args or {}
+
+    if op in ("inspect", "safe_inspect"):
+        target = str(args.get("target", ""))
+        for p in BL.get("paths", []):
+            if target == p or target.startswith(p + "."):
+                return False, f"blocked path '{p}' (target={target})"
+
+    if op == "dive":
+        root      = str(args.get("root", "game.Workspace"))
+        max_depth = int(args.get("max_depth", 2))
+        for rule in BL.get("dive_depth_limits", []):
+            prefix = rule.get("prefix", "")
+            if prefix and root.startswith(prefix) and max_depth > int(rule.get("max_depth", 1)):
+                reason = rule.get("reason", "dive depth limit")
+                return False, (
+                    f"dive on '{root}' limited to depth {rule.get('max_depth',1)} "
+                    f"({reason})"
+                )
+
+    if op == "eval" and SAFE_MODE:
+        code = str(args.get("code", ""))
+        for pat in BL.get("eval_code_blocked", []):
+            try:
+                if re.search(pat, code):
+                    return False, (
+                        f"eval code matches blacklisted pattern '{pat}'. "
+                        "Disable safe_mode to override (POST /safe_mode {enabled:false})."
+                    )
+            except re.error:
+                pass
+
+    return True, None
 
 app = Server("serotonin-bridge")
 
 cmd_queue: asyncio.Queue[dict] = asyncio.Queue()
 pending:   dict[str, asyncio.Future] = {}
-_bridge_sem: asyncio.Semaphore | None = None
 
+_bridge_sem: asyncio.Semaphore | None = None
 
 def _sem() -> asyncio.Semaphore:
     global _bridge_sem
     if _bridge_sem is None:
         _bridge_sem = asyncio.Semaphore(1)
     return _bridge_sem
-
 
 async def bridge_call(op: str, args: dict | None = None, timeout: float = DEFAULT_TIMEOUT) -> Any:
     async with _sem():
@@ -54,7 +136,6 @@ async def bridge_call(op: str, args: dict | None = None, timeout: float = DEFAUL
                 f"Bridge timeout after {timeout}s. Load bridge.lua in Serotonin Scripting tab."
             )
 
-
 def _lua_literal(v: Any) -> str:
     if v is None:               return "nil"
     if isinstance(v, bool):     return "true" if v else "false"
@@ -62,14 +143,12 @@ def _lua_literal(v: Any) -> str:
     if isinstance(v, str):      return json.dumps(v)
     raise TypeError(f"cannot encode {type(v).__name__} as Lua literal")
 
-
 async def http_poll(request: web.Request) -> web.Response:
     try:
         cmd = await asyncio.wait_for(cmd_queue.get(), timeout=POLL_HOLD_SECONDS)
     except asyncio.TimeoutError:
         return web.json_response([])
     return web.json_response([cmd])
-
 
 async def http_result(request: web.Request) -> web.Response:
     try:
@@ -86,13 +165,171 @@ async def http_result(request: web.Request) -> web.Response:
             fut.set_result(data.get("result"))
     return web.json_response({"ok": True})
 
-
 async def http_health(request: web.Request) -> web.Response:
     return web.json_response({
         "queued":  cmd_queue.qsize(),
         "pending": len(pending),
     })
 
+async def http_exec(request: web.Request) -> web.Response:
+    try:
+        data = await request.json()
+    except Exception as e:
+        return web.json_response({"error": f"bad json: {e}"}, status=400)
+    op      = data.get("op")
+    args    = data.get("args") or {}
+    timeout = float(data.get("timeout", DEFAULT_TIMEOUT))
+    if not isinstance(op, str):
+        return web.json_response({"error": "missing 'op'"}, status=400)
+
+    allowed, reason = check_request_safe(op, args)
+    if not allowed:
+        log.info("blocked by safe_mode: op=%s reason=%s", op, reason)
+        return web.json_response(
+            {"ok": False, "error": reason, "blocked_by": "crash_blacklist", "safe_mode": SAFE_MODE},
+            status=400,
+        )
+
+    try:
+        result = await bridge_call(op, args, timeout=timeout)
+        return web.json_response({"ok": True, "result": result})
+    except Exception as e:
+        return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+async def http_safe_mode(request: web.Request) -> web.Response:
+    global SAFE_MODE
+    if request.method == "POST":
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        if "enabled" in data:
+            SAFE_MODE = bool(data["enabled"])
+            log.info("safe_mode set to %s", SAFE_MODE)
+    return web.json_response({
+        "safe_mode":        SAFE_MODE,
+        "blacklist_rules":  {
+            "paths":              len(BL.get("paths", [])),
+            "dive_depth_limits":  len(BL.get("dive_depth_limits", [])),
+            "eval_code_blocked":  len(BL.get("eval_code_blocked", [])),
+            "history":            len(BL.get("history", [])),
+        },
+    })
+
+async def http_blacklist_get(request: web.Request) -> web.Response:
+    return web.json_response({"safe_mode": SAFE_MODE, **BL})
+
+async def http_blacklist_reload(request: web.Request) -> web.Response:
+    global BL
+    BL = load_blacklist()
+    return web.json_response({"ok": True, "rules": {
+        "paths":             len(BL.get("paths", [])),
+        "dive_depth_limits": len(BL.get("dive_depth_limits", [])),
+        "eval_code_blocked": len(BL.get("eval_code_blocked", [])),
+    }})
+
+async def http_blacklist_patch(request: web.Request) -> web.Response:
+    try:
+        data = await request.json()
+    except Exception as e:
+        return web.json_response({"error": f"bad json: {e}"}, status=400)
+
+    added, removed = [], []
+    for bucket in ("paths", "eval_code_blocked"):
+        for v in (data.get("add") or {}).get(bucket, []):
+            if v not in BL.get(bucket, []):
+                BL.setdefault(bucket, []).append(v)
+                added.append(f"{bucket}: {v}")
+        for v in (data.get("remove") or {}).get(bucket, []):
+            if v in BL.get(bucket, []):
+                BL[bucket].remove(v)
+                removed.append(f"{bucket}: {v}")
+
+    for rule in (data.get("add") or {}).get("dive_depth_limits", []):
+        prefix = rule.get("prefix")
+        if not prefix:
+            continue
+        existing = [r for r in BL.get("dive_depth_limits", []) if r.get("prefix") == prefix]
+        if existing:
+            existing[0].update(rule)
+        else:
+            BL.setdefault("dive_depth_limits", []).append(rule)
+        added.append(f"dive_depth_limits: {prefix}")
+    for prefix in (data.get("remove") or {}).get("dive_depth_limits", []):
+        before = len(BL.get("dive_depth_limits", []))
+        BL["dive_depth_limits"] = [r for r in BL.get("dive_depth_limits", []) if r.get("prefix") != prefix]
+        if len(BL["dive_depth_limits"]) < before:
+            removed.append(f"dive_depth_limits: {prefix}")
+
+    save_blacklist()
+    return web.json_response({"ok": True, "added": added, "removed": removed})
+
+async def http_crash_report(request: web.Request) -> web.Response:
+    try:
+        data = await request.json()
+    except Exception as e:
+        return web.json_response({"error": f"bad json: {e}"}, status=400)
+
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "op":        data.get("last_op"),
+        "args":      data.get("last_args"),
+        "note":      data.get("note"),
+    }
+    BL.setdefault("history", []).append(entry)
+    BL["history"] = BL["history"][-50:]
+
+    auto_added: list[str] = []
+
+    if entry["op"] == "dive":
+        a    = entry["args"] or {}
+        root = str(a.get("root", ""))
+        md   = int(a.get("max_depth", 2))
+        for prefix in ("game.Workspace.Live.",):
+            if root.startswith(prefix) and md >= 2:
+                already = any(r.get("prefix") == prefix for r in BL.get("dive_depth_limits", []))
+                if not already:
+                    BL.setdefault("dive_depth_limits", []).append({
+                        "prefix": prefix, "max_depth": 1,
+                        "reason": f"auto: crash reported at {entry['timestamp']}",
+                    })
+                    auto_added.append(f"dive_depth_limits: {prefix} max_depth=1")
+
+    if entry["op"] in ("inspect", "safe_inspect"):
+        target = str((entry["args"] or {}).get("target", ""))
+        if target.startswith("game.") and target not in BL.get("paths", []):
+            BL.setdefault("paths", []).append(target)
+            auto_added.append(f"paths: {target}")
+
+    if entry["op"] == "eval":
+        code = str((entry["args"] or {}).get("code", "")).strip()
+        m = re.fullmatch(r"return\s+(game\s*\.[\w\.]+)\s*;?", code)
+        if m:
+            pat = re.escape(m.group(1))
+            if pat not in BL.get("eval_code_blocked", []):
+                BL.setdefault("eval_code_blocked", []).append(pat)
+                auto_added.append(f"eval_code_blocked: {pat}")
+
+    save_blacklist()
+    log.info("crash_report: %s auto_added=%s", entry["op"], auto_added)
+    return web.json_response({"ok": True, "recorded": entry, "auto_added": auto_added})
+
+async def http_cancel(request: web.Request) -> web.Response:
+    dropped_q = 0
+    while not cmd_queue.empty():
+        try:
+            cmd_queue.get_nowait()
+            dropped_q += 1
+        except asyncio.QueueEmpty:
+            break
+    dropped_p = 0
+    for cmd_id, fut in list(pending.items()):
+        if not fut.done():
+            fut.set_exception(RuntimeError("cancelled"))
+        pending.pop(cmd_id, None)
+        dropped_p += 1
+    log.info("cancel: dropped %d queued, %d pending", dropped_q, dropped_p)
+    return web.json_response({"ok": True, "dropped_queued": dropped_q, "dropped_pending": dropped_p})
 
 TOOLS: list[types.Tool] = [
     types.Tool(
@@ -104,10 +341,10 @@ TOOLS: list[types.Tool] = [
         name="serotonin_eval",
         description=(
             "Execute arbitrary Lua code in the Serotonin runtime. "
-            "Code is wrapped as `return (function() <code> end)()`, so `return <expr>` "
-            "or a bare expression both return a value. "
-            "Instances serialize to {__type:'Instance', handle, ClassName, Name, Address}; "
-            "Vector3 -> {X,Y,Z}; Color3 -> {R,G,B}."
+            "The code is wrapped as `return (function() <code> end)()`, so either "
+            "`return <expr>` or just `<expr>` works to return a value. "
+            "Result is serialized: Instances become {__type:'Instance', handle, ClassName, Name, Address}; "
+            "Vector3 → {X,Y,Z}; Color3 → {R,G,B}. Handles are valid until the script is unloaded."
         ),
         inputSchema={
             "type": "object",
@@ -122,8 +359,9 @@ TOOLS: list[types.Tool] = [
     types.Tool(
         name="serotonin_inspect",
         description=(
-            "Return properties, Attributes, Children, and ChildrenCount of one Instance. "
-            "`target` is a dot-path (e.g. 'game.Workspace.Live.Player1') or a handle (e.g. 'h42')."
+            "Return a detailed view of one Instance: known properties, Attributes, "
+            "Children (serialized), ChildrenCount, and a fresh handle. "
+            "`target` is either a dot-path (e.g. 'game.Workspace') or a handle (e.g. 'h42')."
         ),
         inputSchema={
             "type": "object",
@@ -152,7 +390,7 @@ TOOLS: list[types.Tool] = [
     ),
     types.Tool(
         name="serotonin_tree",
-        description="Return the child tree of `root` up to `max_depth`, each node with Name/ClassName.",
+        description="Return the child tree of `root` up to `max_depth` (default 2), each node with Name/ClassName.",
         inputSchema={
             "type": "object",
             "properties": {
@@ -165,8 +403,10 @@ TOOLS: list[types.Tool] = [
     types.Tool(
         name="serotonin_list_players",
         description=(
-            "Return entity.GetPlayers() with cached per-player fields. "
-            "For live positions use serotonin_players_full instead."
+            "Return entity.GetPlayers() with cached per-player fields "
+            "(Name, DisplayName, Team, Health, MaxHealth, Position, Velocity, "
+            "IsAlive, IsEnemy, IsVisible, Weapon, BoundingBox, TeamColor). "
+            "Uses pcall on each field so missing ones are silently omitted."
         ),
         inputSchema={
             "type": "object",
@@ -192,7 +432,7 @@ TOOLS: list[types.Tool] = [
     ),
     types.Tool(
         name="serotonin_get_bones",
-        description="For a player index, return Position/Size/Rotation for a list of bones.",
+        description="For a player index, fetch Position/Size/Rotation for a list of bones.",
         inputSchema={
             "type": "object",
             "properties": {
@@ -213,8 +453,9 @@ TOOLS: list[types.Tool] = [
     types.Tool(
         name="serotonin_memory_read",
         description=(
-            "memory.Read(type, address). Accepted types (verified): "
-            "byte, short, int64, uint64, float, double, bool, string, ptr, pointer. "
+            "memory.Read(type, address). Supported types (verified empirically): "
+            "'byte', 'short', 'int64', 'uint64', 'float', 'double', 'bool', 'string', 'ptr', 'pointer'. "
+            "Docs mention int8/int16/int32 but those are NOT accepted. "
             "For 32-bit reads, read as int64 and mask with % 0x100000000."
         ),
         inputSchema={
@@ -241,17 +482,23 @@ TOOLS: list[types.Tool] = [
     ),
     types.Tool(
         name="serotonin_memory_base",
-        description="Return memory.GetBase() - base address of RobloxPlayerBeta.exe.",
+        description="Return memory.GetBase() — base address of RobloxPlayerBeta.exe.",
         inputSchema={"type": "object", "properties": {}},
     ),
+
     types.Tool(
         name="serotonin_find_by_class",
-        description="Return all descendants of `root` whose ClassName equals `class_name`.",
+        description=(
+            "Return all descendants of `root` whose ClassName equals `class_name`. "
+            "Much faster and more common than search_instances for type-based queries. "
+            "Use this to find all Humanoids, Parts, LocalScripts, etc."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
                 "class_name": {"type": "string"},
-                "root":       {"type": "string", "default": "game.Workspace"},
+                "root":       {"type": "string", "default": "game.Workspace",
+                               "description": "Lua expression for root (e.g. game, game.Workspace, game:GetService('Players'))"},
                 "limit":      {"type": "integer", "default": 200, "minimum": 1, "maximum": 5000},
             },
             "required": ["class_name"],
@@ -261,7 +508,8 @@ TOOLS: list[types.Tool] = [
         name="serotonin_find_player_model",
         description=(
             "Find the player Model in game.Workspace.Live by Name. Returns the Model "
-            "with children and HumanoidRootPart position/velocity."
+            "with children serialized. Useful when entity.GetPlayers() gives you a name "
+            "but you need the live Workspace model (to read HumanoidRootPart, Tank parts, etc.)."
         ),
         inputSchema={
             "type": "object",
@@ -274,8 +522,9 @@ TOOLS: list[types.Tool] = [
     types.Tool(
         name="serotonin_nearest",
         description=(
-            "Find the nearest descendant matching `class_name` (or any) within `radius` studs "
-            "of `origin` (or LocalPlayer HRP). Returns {instance, distance} or null."
+            "Find the nearest descendant matching `class_name` (or any class if omitted) "
+            "within `radius` studs of `origin` (or LocalPlayer HRP if omitted). "
+            "Returns {instance, distance} or null."
         ),
         inputSchema={
             "type": "object",
@@ -289,7 +538,10 @@ TOOLS: list[types.Tool] = [
     ),
     types.Tool(
         name="serotonin_descendants_stats",
-        description="Return ClassName -> count map for root:GetDescendants(), plus total.",
+        description=(
+            "Return ClassName → count map for root:GetDescendants(), plus total. "
+            "First call to understand what's in a container (e.g. 'what's in game.Workspace')."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
@@ -301,8 +553,8 @@ TOOLS: list[types.Tool] = [
     types.Tool(
         name="serotonin_get_scripts",
         description=(
-            "List all Script / LocalScript / ModuleScript descendants of `root` with their dot-path. "
-            "Source code is not exposed by the Serotonin API."
+            "List all Script / LocalScript / ModuleScript descendants of `root`, with their "
+            "full dot-path from DataModel. Source code is NOT accessible via Serotonin API."
         ),
         inputSchema={
             "type": "object",
@@ -315,8 +567,8 @@ TOOLS: list[types.Tool] = [
     types.Tool(
         name="serotonin_players_full",
         description=(
-            "Per-player dump: all entity fields, live HumanoidRootPart world position, "
-            "and screen projection. Prefer this over list_players."
+            "Comprehensive per-player dump: all entity fields, live HumanoidRootPart world "
+            "position (bone method), and screen projection. Prefer this over list_players."
         ),
         inputSchema={
             "type": "object",
@@ -327,7 +579,10 @@ TOOLS: list[types.Tool] = [
     ),
     types.Tool(
         name="serotonin_project_to_screen",
-        description="utility.WorldToScreen(Vector3) - project a world position to 2D. Returns {x, y, on_screen}.",
+        description=(
+            "utility.WorldToScreen(Vector3) — project a world position to 2D screen. "
+            "Returns {x, y, on_screen}."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
@@ -340,16 +595,18 @@ TOOLS: list[types.Tool] = [
     ),
     types.Tool(
         name="serotonin_screen_info",
-        description="Window/camera/input snapshot: window size, camera pos, mouse pos, delta time, tick, menu open.",
+        description=(
+            "Window/camera/input snapshot: window size, camera position, mouse position, "
+            "delta time, tick count, menu open state."
+        ),
         inputSchema={"type": "object", "properties": {}},
     ),
-]
 
+]
 
 @app.list_tools()
 async def _list_tools() -> list[types.Tool]:
     return TOOLS
-
 
 @app.call_tool()
 async def _call_tool(name: str, arguments: dict | None) -> list[types.TextContent]:
@@ -361,7 +618,6 @@ async def _call_tool(name: str, arguments: dict | None) -> list[types.TextConten
         return [types.TextContent(type="text", text=f"ERROR: {e}")]
     text = json.dumps(result, indent=2, ensure_ascii=False, default=str)
     return [types.TextContent(type="text", text=text)]
-
 
 async def _dispatch(name: str, a: dict) -> Any:
     if name == "serotonin_ping":
@@ -454,6 +710,7 @@ for i, p in ipairs(players) do
         local ok, v = pcall(function() return p[f] end)
         if ok and v ~= nil then rec[f] = v end
     end
+    -- Real-time world pos via bone method (entity.Position is often stale in FFA)
     local ok, v = pcall(function() return p:GetBonePosition("HumanoidRootPart") end)
     if ok and v ~= nil then rec.HRP = v end
     out[i] = rec
@@ -513,7 +770,7 @@ return out
         code = f"""
 local players = entity.GetPlayers()
 local p = players and players[{idx}]
-if not p then return {{ error = "no player at index {idx}" }} end
+if not p then return {{ error = "no player at index {idx}, have " .. tostring(players and #players or 0) }} end
 local bones = {bones_lua}
 local out = {{ PlayerName = (pcall(function() return p.Name end) and p.Name) or "?" }}
 local list = {{}}
@@ -630,12 +887,19 @@ return {
 
     raise RuntimeError(f"unknown tool: {name}")
 
-
 async def start_http_server() -> web.AppRunner:
     http_app = web.Application()
-    http_app.router.add_get ("/poll",   http_poll)
-    http_app.router.add_post("/result", http_result)
-    http_app.router.add_get ("/health", http_health)
+    http_app.router.add_get ("/poll",          http_poll)
+    http_app.router.add_post("/result",        http_result)
+    http_app.router.add_get ("/health",        http_health)
+    http_app.router.add_post("/exec",          http_exec)
+    http_app.router.add_post("/cancel",        http_cancel)
+    http_app.router.add_get ("/safe_mode",     http_safe_mode)
+    http_app.router.add_post("/safe_mode",     http_safe_mode)
+    http_app.router.add_get ("/blacklist",         http_blacklist_get)
+    http_app.router.add_post("/blacklist",         http_blacklist_patch)
+    http_app.router.add_post("/blacklist/reload",  http_blacklist_reload)
+    http_app.router.add_post("/crash_report",      http_crash_report)
     runner = web.AppRunner(http_app)
     await runner.setup()
     site = web.TCPSite(runner, HTTP_HOST, HTTP_PORT)
@@ -643,12 +907,20 @@ async def start_http_server() -> web.AppRunner:
     log.info("HTTP coordinator listening on http://%s:%d", HTTP_HOST, HTTP_PORT)
     return runner
 
-
 async def main() -> None:
+    global BL
+    BL = load_blacklist()
+    log.info(
+        "blacklist loaded: %d paths, %d dive rules, %d eval patterns, %d history",
+        len(BL.get("paths", [])),
+        len(BL.get("dive_depth_limits", [])),
+        len(BL.get("eval_code_blocked", [])),
+        len(BL.get("history", [])),
+    )
     runner = await start_http_server()
     try:
         if os.environ.get("SEROTONIN_HTTP_ONLY") == "1":
-            log.info("HTTP-only mode - MCP stdio disabled")
+            log.info("HTTP-only mode — MCP stdio disabled, idling forever")
             while True:
                 await asyncio.sleep(3600)
         async with stdio_server() as (read_stream, write_stream):
@@ -660,14 +932,13 @@ async def main() -> None:
                     server_name    = "serotonin-bridge",
                     server_version = "0.1.0",
                     capabilities   = app.get_capabilities(
-                        notification_options     = NotificationOptions(),
+                        notification_options = NotificationOptions(),
                         experimental_capabilities = {},
                     ),
                 ),
             )
     finally:
         await runner.cleanup()
-
 
 if __name__ == "__main__":
     try:

@@ -12,6 +12,16 @@ MCP client  <-- stdio -->  server.py  <-- HTTP :8765 -->  bridge.lua  <-->  Sero
 
 `bridge.lua` runs inside Serotonin and long-polls the Python coordinator. When a tool call arrives, the Lua side executes it, serializes the result (Instances become handles you can pass back; Vector3/Color3 keep their types), and posts it back. An asyncio semaphore + one-at-a-time polling means parallel MCP calls can't stack parallel evals inside Serotonin - that path crashes the cheat reliably.
 
+## Crash protection
+
+Some Lua expressions in Serotonin trigger native C++ exceptions that `pcall` can't catch - they kill the cheat DLL. Reading `_G`, `game.DataModel`, `game.PlaceID`, `game.LocalPlayer.Backpack`, calling `Color3:ToHSV()` - all confirmed crashers. This release ships with:
+
+- A **safe-mode pre-flight** in `server.py` that checks every op against `crash_blacklist.json` before it leaves the Python process. In safe mode (default: on) blocked ops never reach the cheat.
+- A **class-based property allowlist** in `bridge.lua` - only documented properties are read via `safe_inspect` / `dive`. Undocumented fields are a known crash vector (Serotonin's proxy tries to resolve them via raw memory and faults on unknown offsets).
+- A **`/crash_report` endpoint** that auto-extracts blacklist rules when you feed it the last-known-bad op. Learn once, never repeat.
+
+If you hit a new crasher, POST it to `/crash_report` and it gets persisted.
+
 ## Requirements
 
 - Windows 10/11 + Serotonin
@@ -59,7 +69,8 @@ Put it wherever your client expects it (project-local `.mcp.json`, user-level co
 1. Launch Roblox + Serotonin.
 2. In the Scripting tab, **Load** `bridge.lua`. You should see:
    ```
-   [serotonin-bridge] loaded, polling http://127.0.0.1:8765
+   [serotonin-bridge v2] loaded, polling http://127.0.0.1:8765
+   [serotonin-bridge v2] ops: ping eval inspect safe_inspect snapshot dive live_dump class_counts list_scripts search
    ```
 3. Start your MCP client - it'll spawn `server.py` over stdio on demand.
 4. Call `serotonin_ping`. If you get `"pong"`, you're done.
@@ -71,7 +82,7 @@ If it times out, the bridge isn't running or can't reach `127.0.0.1:8765`. Reloa
 | Tool | What it does |
 |---|---|
 | `serotonin_ping` | Liveness check. |
-| `serotonin_eval` | Run arbitrary Lua. Instances / Vector3 / Color3 get serialized automatically. |
+| `serotonin_eval` | Run arbitrary Lua. Instances / Vector3 / Color3 get serialized automatically. Blocked patterns don't reach the cheat in safe mode. |
 | `serotonin_inspect` | Properties, Attributes, Children for one Instance. Takes a dot-path or a handle. |
 | `serotonin_search_instances` | Walk `GetDescendants` with Name substring + optional ClassName filter. |
 | `serotonin_tree` | Recursive Name/ClassName dump up to N levels. |
@@ -90,19 +101,38 @@ If it times out, the bridge isn't running or can't reach `127.0.0.1:8765`. Reloa
 | `serotonin_memory_write` | `memory.Write(type, addr, value)`. |
 | `serotonin_memory_base` | `memory.GetBase()`. |
 
-## A few things that bit me
+## HTTP endpoints (for shell / debugging)
 
-**Memory types.** The docs list `int8/16/32` etc. - those are lies. Actually accepted: `byte`, `short`, `int64`, `uint64`, `float`, `double`, `bool`, `string`, `ptr`, `pointer`. For a 32-bit read, grab `int64` and mask with `% 0x100000000`.
+On top of the MCP tools, `server.py` exposes a few HTTP routes for when you want to drive the bridge directly with `curl` or another script:
 
-**`_G` doesn't exist.** Serotonin runs Lua in a sandbox where `_G` is nil. Use `getfenv(1)` if you need the env table. `resolve_target` in `bridge.lua` already does this.
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/exec` | Run one op (`{op, args, timeout}`). Pre-flight checked against the blacklist. |
+| POST | `/cancel` | Drop every queued command and cancel every pending future. Use after a crash. |
+| GET / POST | `/safe_mode` | Get or toggle (`{enabled: true/false}`). |
+| GET | `/blacklist` | Full blacklist dump. |
+| POST | `/blacklist` | Patch (`{add: {paths, dive_depth_limits, eval_code_blocked}, remove: {...}}`). |
+| POST | `/blacklist/reload` | Re-read `crash_blacklist.json` from disk. |
+| POST | `/crash_report` | Report a crash (`{last_op, last_args, note}`). Auto-extracts rules for known crash shapes. |
+| GET | `/health` | Queue depth. |
 
-**Entity API returns userdata, not indices.** Docs say `entity.GetPlayers()` returns integers. It returns userdata objects. Access fields as `p.Name`, `p.Health`; call bone methods as `p:GetBonePosition("HumanoidRootPart")`. Indexing `entity.Name(idx)` doesn't work.
+## Things that bite (and how this release handles them)
+
+**Memory types.** The verified accepted types are: `byte`, `short`, `ushort`, `int`, `uint`, `int64`, `uint64`, `float`, `double`, `bool`, `string`, `ptr`, `pointer`, `vector2`, `vector3`, `color3`, `cframe` (read-only). All 13 numeric/pointer types tested working against `memory.GetBase()`. The old `int8/16/32` shortcuts are not accepted.
+
+**`_G` is a native crasher.** Not just nil - even `type(_G)` inside `pcall` takes down the DLL. Blacklisted as regex `\b_G\b`. Use `getfenv(1)` if you need the env table.
+
+**`game.GetService` uses dot syntax, not colon.** `game.GetService("Players")` works; `game:GetService(...)` returns a `calling 'GetService' on NN` error. The Lua `game` is a sandbox proxy table, not an Instance userdata - `:IsDescendantOf` / `:IsAncestorOf` fail on it for the same reason.
+
+**Entity API returns userdata, not indices.** Docs say `entity.GetPlayers()` returns integers. It returns userdata objects. Access fields as `p.Name`, `p.Health`; call bone methods as `p:GetBonePosition("HumanoidRootPart")`.
 
 **`entity.Position` is often stale.** In FFA / Tank-style modes the cached position stays at `(0,0,0)`. Use `p:GetBonePosition("HumanoidRootPart")` for the live value. `serotonin_players_full` does this for you.
 
-**Don't touch `game.PlaceID` or `game.GetFFlag`.** They crash the cheat on at least some builds. They're deliberately not exposed as tools - if you really need them, go through `serotonin_eval` at your own risk.
+**Documented-but-broken.** `Vector3:FuzzyEq` doesn't exist (Lua error). `Color3:ToHSV()` crashes (native). `game.GetFFlag` / `game.SetFFlag` crash. Blacklisted regardless of what the docs say.
 
-**Don't parallelize eval.** Two simultaneous evals crash Serotonin too. The server enforces serial execution end-to-end via a semaphore and single-command polls, so you're safe if you only go through the provided tools. If you bypass with `eval`, keep it sequential.
+**Undocumented LocalPlayer fields crash.** `game.LocalPlayer.Backpack` is a confirmed native crasher. `PlayerGui`, `PlayerScripts`, `StarterGear`, `AccountAge`, `FollowUserId`, and two dozen other undocumented Player properties are blacklisted by a single regex. If you truly need one, turn off safe_mode, disable the pattern, and take the risk.
+
+**Don't parallelize eval.** Two simultaneous evals crash Serotonin. The server enforces serial execution via a semaphore; stay on the tools and you're safe.
 
 ## Configuration
 
@@ -115,9 +145,11 @@ Env vars:
 Tunables in `bridge.lua` (top of file, `CFG` table):
 
 - `base_url` - must match the host/port above
-- `poll_interval_ms` - minimum gap between polls
-- `inflight_ttl_ms` - watchdog reset if `http.Get` callback never fires
-- `max_depth` - default serialization depth
+- `poll_interval_ms` - minimum gap between polls (default 100)
+- `inflight_ttl_ms` - watchdog reset if `http.Get` callback never fires (default 12000)
+- `max_depth` - default serialization depth (default 3)
+
+Timeouts are synchronized: poll hold (9s) < server default timeout (10s) < bridge inflight TTL (12s). Don't break this ordering or the watchdog will race the client and you'll get phantom resets.
 
 ## License
 

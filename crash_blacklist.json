@@ -1,0 +1,28 @@
+{
+    "version": 1,
+    "paths": [
+        "game.DataModel",
+        "game.PlaceID",
+        "game.GetFFlag",
+        "game.SetFFlag"
+    ],
+    "dive_depth_limits": [
+        {
+            "prefix": "game.Workspace.Live.",
+            "max_depth": 1,
+            "reason": "deep dive into Live.<player> may crash on some builds"
+        }
+    ],
+    "eval_code_blocked": [
+        "game\\s*\\.\\s*DataModel",
+        "game\\s*\\.\\s*PlaceID",
+        "game\\s*\\.\\s*GetFFlag",
+        "game\\s*\\.\\s*SetFFlag",
+        ":GetFFlag\\s*\\(",
+        ":SetFFlag\\s*\\(",
+        "\\b_G\\b",
+        "LocalPlayer\\s*\\.\\s*(Backpack|PlayerGui|PlayerScripts|StarterGear|AccountAge|FollowUserId|DevEnableMouseLock|DevCameraOcclusionMode|DevComputerCameraMode|DevComputerMovementMode|DevTouchCameraMode|DevTouchMovementMode|CameraMode|CameraMinZoomDistance|AutoJumpEnabled|HealthDisplayDistance|NameDisplayDistance|Chat|ChatMode|OsPlatform|LocaleId|GameplayPaused|VRDevice|MembershipType|ReplicationFocus|SimulationRadius)",
+        ":ToHSV\\s*\\("
+    ],
+    "history": []
+}
