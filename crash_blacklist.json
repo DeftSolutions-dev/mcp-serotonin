@@ -1,5 +1,5 @@
 {
-    "version": 1,
+    "version": 2,
     "paths": [
         "game.DataModel",
         "game.PlaceID",
@@ -22,7 +22,21 @@
         ":SetFFlag\\s*\\(",
         "\\b_G\\b",
         "LocalPlayer\\s*\\.\\s*(Backpack|PlayerGui|PlayerScripts|StarterGear|AccountAge|FollowUserId|DevEnableMouseLock|DevCameraOcclusionMode|DevComputerCameraMode|DevComputerMovementMode|DevTouchCameraMode|DevTouchMovementMode|CameraMode|CameraMinZoomDistance|AutoJumpEnabled|HealthDisplayDistance|NameDisplayDistance|Chat|ChatMode|OsPlatform|LocaleId|GameplayPaused|VRDevice|MembershipType|ReplicationFocus|SimulationRadius)",
-        ":ToHSV\\s*\\("
+        ":ToHSV\\s*\\(",
+        "audio\\s*\\.\\s*PlaySound\\s*\\(\\s*[\"'][^\"']{0,10}[\"']",
+        "audio\\.PlaySound\\s*\\(\\s*nil",
+        "cheat\\s*\\.\\s*[Ll]oadString\\s*\\("
     ],
-    "history": []
+    "history": [
+        {
+            "added": "2026-04",
+            "rule": "audio\\.PlaySound\\s*\\(\\s*[\"'][^\"']{0,10}[\"']",
+            "reason": "audio.PlaySound with any non-WAV string (verified with '', 'not-wav', 'x') triggers a native SEH crash. The internal WAV loader does not validate the RIFF header before walking it."
+        },
+        {
+            "added": "2026-04",
+            "rule": "cheat\\.LoadString\\s*\\(",
+            "reason": "cheat.LoadString raises 'C++ exception' for every 2-arg invocation we tried in build version-2e6461290a3541f5, including syntactically valid Lua. Use the Lua-standard `loadstring`/`load` instead."
+        }
+    ]
 }
