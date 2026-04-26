@@ -20,6 +20,10 @@ Some Lua expressions in Serotonin trigger native C++ exceptions that `pcall` can
 - A **class-based property allowlist** in `bridge.lua` - only documented properties are read via `safe_inspect` / `dive`. Undocumented fields are a known crash vector (Serotonin's proxy tries to resolve them via raw memory and faults on unknown offsets).
 - A **`/crash_report` endpoint** that auto-extracts blacklist rules when you feed it the last-known-bad op. Learn once, never repeat.
 
+`crash_blacklist.json` is at **version 2** in this release. The new entries (over the v1 baseline) are:
+- `audio.PlaySound` with any string short enough to be obvious bogus or `nil`. Verified to crash the cheat with a native SEH exception.
+- `cheat.LoadString` (any case). Every invocation we tried raised `"C++ exception"` in build `version-2e6461290a3541f5`.
+
 If you hit a new crasher, POST it to `/crash_report` and it gets persisted.
 
 ## Requirements
@@ -31,7 +35,7 @@ If you hit a new crasher, POST it to `/crash_report` and it gets persisted.
 ## Install
 
 ```bash
-git clone https://github.com/<you>/mcp-serotonin.git
+git clone https://github.com/DeftSolutions-dev/mcp-serotonin.git
 cd mcp-serotonin
 pip install -r requirements.txt
 ```
@@ -77,7 +81,9 @@ Put it wherever your client expects it (project-local `.mcp.json`, user-level co
 
 If it times out, the bridge isn't running or can't reach `127.0.0.1:8765`. Reload the Lua script, check the cheat console for errors.
 
-## Tools
+## Tools (30 wrappers)
+
+### Instance / world exploration
 
 | Tool | What it does |
 |---|---|
@@ -91,15 +97,59 @@ If it times out, the bridge isn't running or can't reach `127.0.0.1:8765`. Reloa
 | `serotonin_nearest` | Nearest instance of a class within a radius. Origin defaults to LocalPlayer. |
 | `serotonin_descendants_stats` | ClassName histogram for a subtree. |
 | `serotonin_get_scripts` | All `Script`/`LocalScript`/`ModuleScript` with dot-paths. Source isn't exposed. |
+
+### Entity / parts / players
+
+| Tool | What it does |
+|---|---|
 | `serotonin_list_players` | `entity.GetPlayers()` + cached fields. |
 | `serotonin_players_full` | Entity fields + live HumanoidRootPart + screen projection. Prefer this. |
-| `serotonin_list_parts` | `entity.GetParts()` with optional radius filter. |
+| `serotonin_list_parts` | `entity.GetParts()` with optional radius filter. Set `include_extras=true` for Address/ClassName/Primitive/Color/Transparency/Shape/MeshId/HasMesh per part. |
+| `serotonin_parts_count` | `entity.GetPartsCount()`. Cheap total count of cached parts. |
+| `serotonin_part_details` | Full per-part dump for one index: pos/size/rot + extras + `GetPartCubeVertices` (8 OBB corners). |
 | `serotonin_get_bones` | Position/Size/Rotation for named bones of a player index. |
+
+### Screen / projection
+
+| Tool | What it does |
+|---|---|
 | `serotonin_project_to_screen` | `utility.WorldToScreen` for a Vector3. |
 | `serotonin_screen_info` | Window size, camera, mouse, delta time, menu state. |
+
+### Memory
+
+| Tool | What it does |
+|---|---|
 | `serotonin_memory_read` | `memory.Read(type, addr)`. |
 | `serotonin_memory_write` | `memory.Write(type, addr, value)`. |
 | `serotonin_memory_base` | `memory.GetBase()`. |
+| `serotonin_memory_scan` | `memory.Scan(pattern, [module])`. AOB pattern with `??` wildcards. Returns first absolute address (1-arg form) or array of all matches inside the named module. |
+| `serotonin_memory_is_valid` | `memory.IsValid(addr)`. True if the virtual address sits inside a readable page in the Roblox process. |
+
+### File sandbox (`C:\Serotonin\files`)
+
+| Tool | What it does |
+|---|---|
+| `serotonin_file_read` | `file.read(path)`. Returns the file contents as a string, or null when the file is missing. |
+| `serotonin_file_write` | `file.write(path, content)` (default) or `file.append` when `append: true`. Returns true on success, false when the parent directory is missing. |
+| `serotonin_file_listdir` | `file.listdir(path)`. Returns array of `{name, isDirectory, isFile, size?}` records. Pass empty string for sandbox root. |
+| `serotonin_file_op` | One-shot metadata op: `exists` / `isdir` / `mkdir` (recursive) / `delete`. |
+
+### Audio (safe subset)
+
+| Tool | What it does |
+|---|---|
+| `serotonin_audio_beep` | `audio.Beep(freq, ms)`. Synchronous, blocks for `ms`. |
+| `serotonin_audio_stop_all` | `audio.StopAll()`. Silences every playing sound. |
+
+`audio.PlaySound` is intentionally **not** wrapped because non-WAV input crashes the cheat with a native SEH exception. Drive `PlaySound` through `serotonin_eval` only when you control the bytes (e.g. `file.read` of a known-good `.wav`).
+
+### UI (drive the cheat menu)
+
+| Tool | What it does |
+|---|---|
+| `serotonin_ui_get_value` | `ui.GetValue(tab, container, label)`. Reads a widget's current value (type depends on the widget kind). |
+| `serotonin_ui_set_value` | `ui.SetValue(tab, container, label, value)`. Value must match the widget kind: bool / number / string / `{r,g,b,a}` / 1-based index / VK code, etc. |
 
 ## HTTP endpoints (for shell / debugging)
 
@@ -129,6 +179,12 @@ On top of the MCP tools, `server.py` exposes a few HTTP routes for when you want
 **`entity.Position` is often stale.** In FFA / Tank-style modes the cached position stays at `(0,0,0)`. Use `p:GetBonePosition("HumanoidRootPart")` for the live value. `serotonin_players_full` does this for you.
 
 **Documented-but-broken.** `Vector3:FuzzyEq` doesn't exist (Lua error). `Color3:ToHSV()` crashes (native). `game.GetFFlag` / `game.SetFFlag` crash. Blacklisted regardless of what the docs say.
+
+**`audio.PlaySound` crashes on any non-WAV string.** Verified with `""`, `"not-wav"`, single-byte `"x"`. The internal WAV loader does not validate the RIFF header before walking it, so a bad string triggers a native SEH crash that `pcall` cannot catch. Blacklisted as `audio\.PlaySound\s*\(\s*["'][^"']{0,10}["']` plus a `nil`-arg variant. Pass real WAV bytes from `file.read` or `http.Get` only.
+
+**`cheat.LoadString` is broken in build `version-2e6461290a3541f5`.** Every 2-arg invocation we tried, including syntactically valid Lua like `("name", "x = 1")`, raised `"C++ exception"`. Blacklisted. Use the standard Lua `loadstring` / `load` functions instead, they work cleanly in the sandbox.
+
+**`raknet` is vestigial.** `raknet.is_connected()` returns `false` even on a live server, and callbacks added through `raknet.add_send_hook` never fire. Roblox abandoned RakNet around 2015 in favor of an ENet-derived stack; the API surface remains for backward compatibility but observes no packets. Hook at a different layer (memory patches, RemoteEvent interface) for traffic capture.
 
 **Undocumented LocalPlayer fields crash.** `game.LocalPlayer.Backpack` is a confirmed native crasher. `PlayerGui`, `PlayerScripts`, `StarterGear`, `AccountAge`, `FollowUserId`, and two dozen other undocumented Player properties are blacklisted by a single regex. If you truly need one, turn off safe_mode, disable the pattern, and take the risk.
 
