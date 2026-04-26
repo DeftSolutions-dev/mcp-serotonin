@@ -419,15 +419,42 @@ TOOLS: list[types.Tool] = [
         name="serotonin_list_parts",
         description=(
             "Return entity.GetParts() with Position/Size/Rotation for each cached part. "
-            "Optionally filter by distance from `origin` within `radius`."
+            "Optionally filter by distance from `origin` within `radius`. "
+            "Set `include_extras=true` to also include Address/ClassName/Primitive/Color/"
+            "Transparency/Shape/MeshId/HasMesh per part (uses new entity.GetPart* methods)."
         ),
         inputSchema={
             "type": "object",
             "properties": {
-                "origin":      {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3},
-                "radius":      {"type": "number"},
-                "max_results": {"type": "integer", "default": 500},
+                "origin":         {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3},
+                "radius":         {"type": "number"},
+                "max_results":    {"type": "integer", "default": 500},
+                "include_extras": {"type": "boolean", "default": False},
             },
+        },
+    ),
+    types.Tool(
+        name="serotonin_parts_count",
+        description=(
+            "Return entity.GetPartsCount() — total number of cached parts. "
+            "Cheap call, useful before deciding to enumerate via list_parts."
+        ),
+        inputSchema={"type": "object", "properties": {}},
+    ),
+    types.Tool(
+        name="serotonin_part_details",
+        description=(
+            "Full metadata for ONE cached part by its `index` (1-based, from entity.GetParts()). "
+            "Returns Position/Size/Rotation + Address/ClassName/Primitive/Color/"
+            "Transparency/Shape/MeshId/HasMesh + CubeVertices (8 corners of OBB). "
+            "Each field is captured under pcall — missing methods are silently omitted."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "index": {"type": "integer", "minimum": 1},
+            },
+            "required": ["index"],
         },
     ),
     types.Tool(
@@ -602,6 +629,127 @@ TOOLS: list[types.Tool] = [
         inputSchema={"type": "object", "properties": {}},
     ),
 
+    # ---- file ops (cheat sandbox at C:\Serotonin\files) -----------------
+    types.Tool(
+        name="serotonin_file_read",
+        description="file.read(path). Returns the file contents as a string, or null if missing. Path resolves under the cheat sandbox unless absolute.",
+        inputSchema={
+            "type": "object",
+            "properties": { "path": {"type": "string"} },
+            "required": ["path"],
+        },
+    ),
+    types.Tool(
+        name="serotonin_file_write",
+        description="file.write(path, content). Overwrites the file. Returns true on success, false if the parent directory is missing. Use serotonin_file_mkdir first for nested paths.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "path":    {"type": "string"},
+                "content": {"type": "string"},
+                "append":  {"type": "boolean", "default": False, "description": "use file.append instead of file.write (creates the file if missing)"},
+            },
+            "required": ["path", "content"],
+        },
+    ),
+    types.Tool(
+        name="serotonin_file_listdir",
+        description="file.listdir(path). Returns an array of {name, isDirectory, isFile, size?} records, or null for a missing directory. Pass empty string for the sandbox root.",
+        inputSchema={
+            "type": "object",
+            "properties": { "path": {"type": "string", "default": ""} },
+        },
+    ),
+    types.Tool(
+        name="serotonin_file_op",
+        description="One-shot file metadata op: 'exists' / 'isdir' / 'mkdir' (recursive) / 'delete'. Returns the boolean result of the underlying call.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "op":   {"type": "string", "enum": ["exists", "isdir", "mkdir", "delete"]},
+                "path": {"type": "string"},
+            },
+            "required": ["op", "path"],
+        },
+    ),
+
+    # ---- memory.Scan -----------------------------------------------------
+    types.Tool(
+        name="serotonin_memory_scan",
+        description="memory.Scan(pattern, [module]). Pattern is a hex AOB with '??' wildcards. With one arg returns the first absolute address as a number or nil. With a module string returns an array of all matches inside that module.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string", "description": "AOB pattern, e.g. '48 89 5C 24 ??'"},
+                "module":  {"type": "string", "description": "optional, e.g. 'RobloxPlayerBeta.exe'"},
+                "limit":   {"type": "integer", "default": 100, "description": "max addresses to return for the table form"},
+            },
+            "required": ["pattern"],
+        },
+    ),
+    types.Tool(
+        name="serotonin_memory_is_valid",
+        description="memory.IsValid(address). Returns true if the virtual address is inside a readable page in the Roblox process.",
+        inputSchema={
+            "type": "object",
+            "properties": { "address": {"type": "integer"} },
+            "required": ["address"],
+        },
+    ),
+
+    # ---- audio.Beep (safe), audio.StopAll --------------------------------
+    types.Tool(
+        name="serotonin_audio_beep",
+        description="audio.Beep(freq_hz, duration_ms). Plays a system beep. Synchronous, blocks for duration_ms. PlaySound is intentionally not exposed because non-WAV input crashes the cheat.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "freq_hz":     {"type": "integer", "minimum": 1, "maximum": 32000},
+                "duration_ms": {"type": "integer", "minimum": 1, "maximum": 5000},
+            },
+            "required": ["freq_hz", "duration_ms"],
+        },
+    ),
+    types.Tool(
+        name="serotonin_audio_stop_all",
+        description="audio.StopAll(). Silences every playing sound. Safe no-op when nothing is playing.",
+        inputSchema={"type": "object", "properties": {}},
+    ),
+
+    # ---- ui state read/write ---------------------------------------------
+    types.Tool(
+        name="serotonin_ui_get_value",
+        description="ui.GetValue(tab, container, label). Reads a widget's current value. Return type depends on the widget kind (bool / number / string / table).",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "tab":       {"type": "string"},
+                "container": {"type": "string"},
+                "label":     {"type": "string"},
+            },
+            "required": ["tab", "container", "label"],
+        },
+    ),
+    types.Tool(
+        name="serotonin_ui_set_value",
+        description=(
+            "ui.SetValue(tab, container, label, value). Value type must match the widget. "
+            "Pass JSON for table values: Multiselect={'1':true,'2':false,...}, "
+            "Colorpicker={'r':R,'g':G,'b':B,'a':A}, Hotkey=number (Windows VK code), "
+            "Dropdown/Listbox=number (1-based index)."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "tab":       {"type": "string"},
+                "container": {"type": "string"},
+                "label":     {"type": "string"},
+                "value":     {},
+            },
+            "required": ["tab", "container", "label", "value"],
+        },
+    ),
+
 ]
 
 @app.list_tools()
@@ -720,9 +868,10 @@ return out
         return await bridge_call("eval", {"code": code, "maxdepth": 4})
 
     if name == "serotonin_list_parts":
-        origin      = a.get("origin")
-        radius      = a.get("radius")
-        max_results = int(a.get("max_results", 500))
+        origin         = a.get("origin")
+        radius         = a.get("radius")
+        max_results    = int(a.get("max_results", 500))
+        include_extras = bool(a.get("include_extras", False))
         if origin is not None:
             ox, oy, oz = map(float, origin)
         else:
@@ -736,27 +885,136 @@ local ox, oy, oz = {ox}, {oy}, {oz}
 local have = {("true" if have_filter else "false")}
 local r2 = {rad * rad}
 local mx = {max_results}
+local extras = {("true" if include_extras else "false")}
+
+local function take(fn, idx)
+    if type(fn) ~= "function" then return nil end
+    local ok, v = pcall(fn, idx)
+    if ok then return v end
+end
+local function take_color(idx)
+    if type(entity.GetPartColor) ~= "function" then return nil end
+    local ok, c1, c2, c3 = pcall(entity.GetPartColor, idx)
+    if not ok or c1 == nil then return nil end
+    if type(c1) == "number" then
+        return {{ R = c1, G = c2 or 0, B = c3 or 0 }}
+    end
+    if type(c1) == "userdata" then
+        local okR, R = pcall(function() return c1.R end)
+        local okG, G = pcall(function() return c1.G end)
+        local okB, B = pcall(function() return c1.B end)
+        if okR and okG and okB then return {{ R = R, G = G, B = B }} end
+    end
+end
+
+if #parts > 0 and type(entity.getPartPosition) ~= "function" then
+    return {{ error = "entity.getPartPosition not available in this Serotonin build", parts_count = #parts }}
+end
 local out = {{}}
 for _, idx in ipairs(parts) do
     if #out >= mx then break end
-    local x, y, z = entity.getPartPosition(idx)
+    local okp, x, y, z = pcall(entity.getPartPosition, idx)
+    if not okp then break end
     local include = true
     if have then
         local dx, dy, dz = x - ox, y - oy, z - oz
         include = (dx*dx + dy*dy + dz*dz) <= r2
     end
     if include then
-        local sx, sy, sz = entity.getPartSize(idx)
-        local rot = entity.getPartRotation(idx)
-        out[#out+1] = {{
+        local oks, sx, sy, sz = pcall(entity.getPartSize, idx)
+        local okr, rot = pcall(entity.getPartRotation, idx)
+        local rec = {{
             Index = idx,
             Position = {{ X = x, Y = y, Z = z }},
-            Size     = {{ X = sx, Y = sy, Z = sz }},
-            Rotation = rot,
+            Size     = oks and {{ X = sx, Y = sy, Z = sz }} or nil,
+            Rotation = okr and rot or nil,
         }}
+        if extras then
+            rec.Address      = take(entity.GetPartAddress,      idx)
+            rec.ClassName    = take(entity.GetPartClassName,    idx)
+            rec.Primitive    = take(entity.GetPartPrimitive,    idx)
+            rec.Transparency = take(entity.GetPartTransparency, idx)
+            rec.Shape        = take(entity.GetPartShape,        idx)
+            rec.MeshId       = take(entity.GetPartMeshId,       idx)
+            rec.HasMesh      = take(entity.GetPartHasMesh,      idx)
+            rec.Color        = take_color(idx)
+        end
+        out[#out+1] = rec
     end
 end
 return out
+"""
+        return await bridge_call("eval", {"code": code, "maxdepth": 4})
+
+    if name == "serotonin_parts_count":
+        code = """
+if type(entity.GetPartsCount) ~= "function" then
+    return { error = "entity.GetPartsCount not available — Roblox/Serotonin update required" }
+end
+local ok, n = pcall(entity.GetPartsCount)
+if not ok then return { error = tostring(n) } end
+return { Count = n }
+"""
+        return await bridge_call("eval", {"code": code, "maxdepth": 2})
+
+    if name == "serotonin_part_details":
+        idx = int(a["index"])
+        code = f"""
+local idx = {idx}
+local rec = {{ Index = idx }}
+
+local function take(fn)
+    if type(fn) ~= "function" then return nil end
+    local ok, v = pcall(fn, idx)
+    if ok then return v end
+end
+
+if type(entity.getPartPosition) == "function" then
+    local okp, x, y, z = pcall(entity.getPartPosition, idx)
+    if okp then rec.Position = {{ X = x, Y = y, Z = z }} end
+end
+if type(entity.getPartSize) == "function" then
+    local oks, sx, sy, sz = pcall(entity.getPartSize, idx)
+    if oks then rec.Size = {{ X = sx, Y = sy, Z = sz }} end
+end
+if type(entity.getPartRotation) == "function" then
+    local okr, rot = pcall(entity.getPartRotation, idx)
+    if okr then rec.Rotation = rot end
+end
+
+rec.Address      = take(entity.GetPartAddress)
+rec.ClassName    = take(entity.GetPartClassName)
+rec.Primitive    = take(entity.GetPartPrimitive)
+rec.Transparency = take(entity.GetPartTransparency)
+rec.Shape        = take(entity.GetPartShape)
+rec.MeshId       = take(entity.GetPartMeshId)
+rec.HasMesh      = take(entity.GetPartHasMesh)
+
+if type(entity.GetPartColor) == "function" then
+    local okc, c1, c2, c3 = pcall(entity.GetPartColor, idx)
+    if okc and c1 ~= nil then
+        if type(c1) == "number" then
+            rec.Color = {{ R = c1, G = c2 or 0, B = c3 or 0 }}
+        elseif type(c1) == "userdata" then
+            local okR, R = pcall(function() return c1.R end)
+            local okG, G = pcall(function() return c1.G end)
+            local okB, B = pcall(function() return c1.B end)
+            if okR and okG and okB then rec.Color = {{ R = R, G = G, B = B }} end
+        end
+    end
+end
+
+if type(entity.GetPartCubeVertices) == "function" then
+    local okv, v = pcall(entity.GetPartCubeVertices, idx)
+    if okv and v ~= nil then rec.CubeVertices = v end
+end
+
+if type(entity.GetPartsCount) == "function" then
+    local okt, n = pcall(entity.GetPartsCount)
+    if okt then rec.TotalParts = n end
+end
+
+return rec
 """
         return await bridge_call("eval", {"code": code, "maxdepth": 4})
 
@@ -884,6 +1142,68 @@ return {
 }
 """
         return await bridge_call("eval", {"code": code, "maxdepth": 2})
+
+    if name == "serotonin_file_read":
+        code = f"return file.read({json.dumps(a['path'])})"
+        return await bridge_call("eval", {"code": code})
+
+    if name == "serotonin_file_write":
+        fn = "append" if a.get("append") else "write"
+        code = f"return file.{fn}({json.dumps(a['path'])}, {json.dumps(a['content'])})"
+        return await bridge_call("eval", {"code": code})
+
+    if name == "serotonin_file_listdir":
+        path = a.get("path", "")
+        code = f"return file.listdir({json.dumps(path)})"
+        return await bridge_call("eval", {"code": code, "maxdepth": 3})
+
+    if name == "serotonin_file_op":
+        op   = a["op"]
+        path = a["path"]
+        code = f"return file.{op}({json.dumps(path)})"
+        return await bridge_call("eval", {"code": code})
+
+    if name == "serotonin_memory_scan":
+        pattern = a["pattern"]
+        module  = a.get("module")
+        limit   = int(a.get("limit", 100))
+        if module:
+            code = f"""
+local hits = memory.Scan({json.dumps(pattern)}, {json.dumps(module)})
+if type(hits) ~= "table" then return hits end
+local out = {{}}
+for i = 1, math.min({limit}, #hits) do out[i] = hits[i] end
+return {{ count = #hits, addresses = out }}
+"""
+        else:
+            code = f"return memory.Scan({json.dumps(pattern)})"
+        return await bridge_call("eval", {"code": code, "maxdepth": 2})
+
+    if name == "serotonin_memory_is_valid":
+        addr = int(a["address"])
+        code = f"return memory.IsValid({addr})"
+        return await bridge_call("eval", {"code": code})
+
+    if name == "serotonin_audio_beep":
+        freq = int(a["freq_hz"])
+        dur  = int(a["duration_ms"])
+        code = f"audio.Beep({freq}, {dur}) return true"
+        return await bridge_call("eval", {"code": code, "timeout": dur / 1000.0 + 5})
+
+    if name == "serotonin_audio_stop_all":
+        return await bridge_call("eval", {"code": "audio.StopAll() return true"})
+
+    if name == "serotonin_ui_get_value":
+        code = f"return ui.GetValue({json.dumps(a['tab'])}, {json.dumps(a['container'])}, {json.dumps(a['label'])})"
+        return await bridge_call("eval", {"code": code, "maxdepth": 3})
+
+    if name == "serotonin_ui_set_value":
+        value_lua = _lua_literal(a["value"])
+        code = (
+            f"ui.SetValue({json.dumps(a['tab'])}, {json.dumps(a['container'])}, "
+            f"{json.dumps(a['label'])}, {value_lua}) return true"
+        )
+        return await bridge_call("eval", {"code": code})
 
     raise RuntimeError(f"unknown tool: {name}")
 
