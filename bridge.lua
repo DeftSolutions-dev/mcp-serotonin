@@ -4,7 +4,29 @@ local CFG = {
     max_depth        = 3,
     debug            = true,
     inflight_ttl_ms  = 12000,
+    op_budget_max    = 15000,
+    op_time_max_ms   = 8000,
 }
+
+local _OP_BUDGET   = 0
+local _OP_DEADLINE = 0
+local _OP_OVER     = false
+
+local function begin_op()
+    _OP_BUDGET   = 0
+    _OP_OVER     = false
+    _OP_DEADLINE = utility.GetTickCount() + CFG.op_time_max_ms
+end
+
+local function op_budget_ok()
+    if _OP_OVER then return false end
+    if _OP_BUDGET > CFG.op_budget_max then _OP_OVER = true; return false end
+    if utility.GetTickCount() > _OP_DEADLINE then _OP_OVER = true; return false end
+    return true
+end
+
+local HEAVY_SKIP
+local walk_descendants_safe
 
 local json = {}
 local _esc = { ['"'] = '\\"', ['\\'] = '\\\\', ['\b'] = '\\b',
@@ -262,8 +284,79 @@ local SAFE_FIELDS_BY_CLASS = {
 }
 
 local function try_get( v, field )
+    _OP_BUDGET = _OP_BUDGET + 1
+    if _OP_OVER then return nil end
+    if _OP_BUDGET > CFG.op_budget_max then _OP_OVER = true; return nil end
     local ok, result = pcall( function() return v[ field ] end )
     if ok then return result end
+end
+
+HEAVY_SKIP = {
+    Debris           = true,
+    Destructibles    = true,
+    BillboardLods    = true,
+    ParticleEmitters = true,
+    HitEffect        = true,
+    MuzzleEffect     = true,
+    SkyboxLoaded     = true,
+    PlacedBuildings  = true,
+
+    SpawnedVehicles  = true,
+    SpawnedPlayers   = true,
+    Captures         = true,
+    CameraParts      = true,
+    Terrain          = true,
+    Camera           = true,
+}
+
+local DM_SERVICES = { "Workspace", "Players", "Lighting", "ReplicatedStorage",
+                      "ReplicatedFirst", "StarterGui", "StarterPack", "StarterPlayer",
+                      "SoundService", "Teams", "MaterialService", "Chat",
+                      "TextChatService", "ProximityPromptService" }
+
+walk_descendants_safe = function( root, visit, max_nodes, max_depth )
+    max_nodes = max_nodes or 3000
+    max_depth = max_depth or 6
+
+    local stack   = {}
+    local visited = 0
+
+    local ok_root = pcall( function() return root:GetChildren() end )
+    if ok_root then
+        stack[ 1 ] = { root, 0 }
+    else
+        for _, svc in ipairs( DM_SERVICES ) do
+            local ok_s, s = pcall( function() return game.GetService( svc ) end )
+            if ok_s and s ~= nil then stack[ #stack + 1 ] = { s, 0 } end
+        end
+    end
+    while #stack > 0 do
+        if not op_budget_ok() then break end
+        if visited >= max_nodes then break end
+        local entry = table.remove( stack )
+        local node, depth = entry[ 1 ], entry[ 2 ]
+        if depth >= max_depth then
+
+        end
+        local ok_ch, ch = pcall( function() return node:GetChildren() end )
+        if ok_ch and type( ch ) == "table" then
+            for i = 1, #ch do
+                local c = ch[ i ]
+                local nm = try_get( c, "Name" )
+                if nm and HEAVY_SKIP[ nm ] then
+
+                else
+                    visited = visited + 1
+                    visit( c )
+                    if visited >= max_nodes then break end
+                    if depth + 1 < max_depth then
+                        stack[ #stack + 1 ] = { c, depth + 1 }
+                    end
+                end
+            end
+        end
+    end
+    return visited
 end
 
 local function fields_for_class( cls )
@@ -667,20 +760,21 @@ local function op_class_counts( args )
     if not root then return nil, err end
     local limit = args.limit or 3000
     local counts, total = {}, 0
-    local ok, desc = pcall( function() return root:GetDescendants() end )
-    if not ok or type( desc ) ~= "table" then return { Total = 0, Classes = {} } end
-    for i = 1, math.min( #desc, limit ) do
+    walk_descendants_safe( root, function( inst )
         total = total + 1
-        local cls = try_get( desc[ i ], "ClassName" )
+        local cls = try_get( inst, "ClassName" )
         if cls then counts[ cls ] = ( counts[ cls ] or 0 ) + 1 end
-    end
+    end, limit, 5 )
     local sorted = {}
     for c, n in pairs( counts ) do sorted[ #sorted + 1 ] = { ClassName = c, Count = n } end
     table.sort( sorted, function( a, b ) return a.Count > b.Count end )
     return {
         Total     = total,
-        Truncated = ( #desc > limit ) and ( #desc - limit ) or 0,
+        Truncated = _OP_OVER and "budget/time hit" or 0,
         Classes   = sorted,
+        SkipList  = (function()
+            local t = {}; for k in pairs( HEAVY_SKIP ) do t[ #t + 1 ] = k end; return t
+        end)(),
     }
 end
 
@@ -689,14 +783,12 @@ local function op_list_scripts( args )
     if not root then return nil, err end
     local limit = args.limit or 500
     local out = {}
-    local ok, desc = pcall( function() return root:GetDescendants() end )
-    if not ok or type( desc ) ~= "table" then return out end
-    for i = 1, #desc do
-        if #out >= limit then break end
-        local cls = try_get( desc[ i ], "ClassName" )
+    walk_descendants_safe( root, function( inst )
+        if #out >= limit then return end
+        if not op_budget_ok() then return end
+        local cls = try_get( inst, "ClassName" )
         if cls == "Script" or cls == "LocalScript" or cls == "ModuleScript" then
-
-            local path, cur, depth = {}, desc[ i ], 0
+            local path, cur, depth = {}, inst, 0
             while cur and depth < 12 do
                 local n = try_get( cur, "Name" )
                 if type( n ) == "string" and n ~= "" then path[ #path + 1 ] = n end
@@ -708,12 +800,12 @@ local function op_list_scripts( args )
             local rev = {}
             for j = #path, 1, -1 do rev[ #rev + 1 ] = path[ j ] end
             out[ #out + 1 ] = {
-                Name      = try_get( desc[ i ], "Name" ),
+                Name      = try_get( inst, "Name" ),
                 ClassName = cls,
                 Path      = table.concat( rev, "." ),
             }
         end
-    end
+    end, 5000 )
     return out
 end
 
@@ -724,12 +816,9 @@ local function op_search( args )
     local cls_f = args.class_name
     local max_r = args.max_results or 100
     local out   = {}
-    local ok, desc = pcall( function() return root:GetDescendants() end )
-    if not ok or type( desc ) ~= "table" then return out end
-    for i = 1, #desc do
-        if #out >= max_r then break end
-        local inst = desc[ i ]
-        local nm   = try_get( inst, "Name" )
+    walk_descendants_safe( root, function( inst )
+        if #out >= max_r then return end
+        local nm = try_get( inst, "Name" )
         if type( nm ) == "string" and ( pat == "" or string.find( string.lower( nm ), pat, 1, true ) ) then
             local cls = try_get( inst, "ClassName" )
             if not cls_f or cls == cls_f then
@@ -741,7 +830,7 @@ local function op_search( args )
                 }
             end
         end
-    end
+    end, 5000 )
     return out
 end
 
@@ -761,8 +850,18 @@ local OPS = {
 local function dispatch( op, args )
     local fn = OPS[ op ]
     if not fn then return nil, "unknown op: " .. tostring( op ) end
+    begin_op()
     local ok, result, err = pcall( fn, args or {} )
     if not ok then return nil, "handler crash: " .. tostring( result ) end
+
+    if _OP_OVER and not err then
+        if type( result ) == "table" then
+            result._partial = true
+            result._reads   = _OP_BUDGET
+            return result
+        end
+        err = "budget/time limit hit (reads=" .. _OP_BUDGET .. ")"
+    end
     return result, err
 end
 
@@ -770,13 +869,11 @@ function _sero_find_class( cls, root, limit )
     root  = root  or game.Workspace
     limit = limit or 200
     local out = {}
-    local ok, desc = pcall( function() return root:GetDescendants() end )
-    if not ok or type( desc ) ~= "table" then return out end
-    for i = 1, #desc do
-        if #out >= limit then break end
-        local c = try_get( desc[ i ], "ClassName" )
-        if c == cls then out[ #out + 1 ] = desc[ i ] end
-    end
+    walk_descendants_safe( root, function( inst )
+        if #out >= limit then return end
+        local c = try_get( inst, "ClassName" )
+        if c == cls then out[ #out + 1 ] = inst end
+    end, 5000 )
     return out
 end
 
@@ -793,76 +890,160 @@ function _sero_my_pos()
     if ok then return v end
 end
 
-local in_flight    = false
-local inflight_at  = 0
-local last_tick    = 0
-local poll_count   = 0
-local reply_count  = 0
-local JSON_HEADERS = { [ "Content-Type" ] = "application/json",
-                       [ "Accept" ]       = "application/json" }
+function _sero_stats( root, top_n )
+    root  = root  or game.Workspace
+    top_n = top_n or 20
+    local counts, total = {}, 0
+    walk_descendants_safe( root, function( inst )
+        total = total + 1
+        local cls = try_get( inst, "ClassName" )
+        if cls then counts[ cls ] = ( counts[ cls ] or 0 ) + 1 end
+    end, 5000 )
+    local sorted = {}
+    for c, n in pairs( counts ) do sorted[ #sorted + 1 ] = { ClassName = c, Count = n } end
+    table.sort( sorted, function( a, b ) return a.Count > b.Count end )
+    local top = {}
+    for i = 1, math.min( top_n, #sorted ) do top[ i ] = sorted[ i ] end
+    return { Total = total, Classes = top, Truncated = _OP_OVER and "budget/time hit" or 0 }
+end
 
-local function send_result( cmd_id, result, err )
+function _sero_scripts( root, limit )
+    root  = root  or game.Workspace
+    limit = limit or 500
+    local out = {}
+    walk_descendants_safe( root, function( inst )
+        if #out >= limit then return end
+        local cls = try_get( inst, "ClassName" )
+        if cls == "Script" or cls == "LocalScript" or cls == "ModuleScript" then
+            local path, cur, depth = {}, inst, 0
+            while cur and depth < 12 do
+                local n = try_get( cur, "Name" )
+                if type( n ) == "string" and n ~= "" then path[ #path + 1 ] = n end
+                local p = try_get( cur, "Parent" )
+                if p == nil then break end
+                cur = p
+                depth = depth + 1
+            end
+            local rev = {}
+            for j = #path, 1, -1 do rev[ #rev + 1 ] = path[ j ] end
+            out[ #out + 1 ] = { Name = try_get( inst, "Name" ), ClassName = cls, Path = table.concat( rev, "." ) }
+        end
+    end, 5000 )
+    return out
+end
+
+function _sero_nearest( class_name, origin, radius, root )
+    root = root or game.Workspace
+    if origin == nil then
+        origin = _sero_my_pos()
+        if origin == nil then return nil end
+    end
+    local ox = try_get( origin, "X" ); local oy = try_get( origin, "Y" ); local oz = try_get( origin, "Z" )
+    if type( ox ) ~= "number" then return nil end
+    local r2 = radius and ( radius * radius ) or nil
+    local best, best_d2 = nil, nil
+    walk_descendants_safe( root, function( inst )
+        if class_name ~= nil then
+            local cls = try_get( inst, "ClassName" )
+            if cls ~= class_name then return end
+        end
+        local pos = try_get( inst, "Position" )
+        if pos == nil then return end
+        local px = try_get( pos, "X" ); local py = try_get( pos, "Y" ); local pz = try_get( pos, "Z" )
+        if type( px ) ~= "number" then return end
+        local dx, dy, dz = px - ox, py - oy, pz - oz
+        local d2 = dx * dx + dy * dy + dz * dz
+        if r2 ~= nil and d2 > r2 then return end
+        if best_d2 == nil or d2 < best_d2 then best_d2 = d2; best = inst end
+    end, 8000 )
+    if best == nil then return nil end
+    return {
+        instance = {
+            __type    = "Instance",
+            handle    = register_handle( best ),
+            ClassName = try_get( best, "ClassName" ),
+            Name      = try_get( best, "Name" ) or "",
+        },
+        distance = math.sqrt( best_d2 ),
+    }
+end
+
+function _sero_project( vec )
+    if not ( utility and utility.WorldToScreen ) then return nil end
+    local ok, sx, sy, on = pcall( utility.WorldToScreen, vec )
+    if not ok then return nil end
+    return { x = sx, y = sy, on_screen = on }
+end
+
+function _sero_player_snapshot( p )
+    local rec = {}
+    for _, f in ipairs( { "Name", "DisplayName", "UserId", "Team", "Weapon",
+                          "Health", "MaxHealth", "IsAlive", "IsEnemy", "IsVisible",
+                          "IsWhitelisted", "TeamColor" } ) do
+        local okv, v = pcall( function() return p[ f ] end )
+        if okv and v ~= nil then rec[ f ] = v end
+    end
+    for _, b in ipairs( { "HumanoidRootPart", "Head", "UpperTorso" } ) do
+        local okb, bp = pcall( function() return p:GetBonePosition( b ) end )
+        if okb and bp ~= nil then rec[ "Bone_" .. b ] = serialize_value( bp, 0, {} ) end
+    end
+    local hrp = rec.Bone_HumanoidRootPart
+    if hrp and utility and utility.WorldToScreen then
+        local ok2, sx, sy, on = pcall( utility.WorldToScreen, Vector3.new( hrp.X, hrp.Y, hrp.Z ) )
+        if ok2 then rec.Screen = { X = sx, Y = sy, OnScreen = on } end
+    end
+    return rec
+end
+
+local AGENT_DIR   = "agent"
+local CMD_FILE    = AGENT_DIR .. "/cmd.json"
+local RESULT_FILE = AGENT_DIR .. "/result.json"
+local exec_busy   = false
+local last_done   = nil
+local exec_count  = 0
+
+pcall( function() file.mkdir( AGENT_DIR ) end )
+pcall( function() file.delete( CMD_FILE ) end )
+
+local function write_result( cmd_id, result, err )
     local body = json.encode( { id = cmd_id, result = result, error = err } )
-    if CFG.debug then print( "[bridge] POST /result id=" .. tostring( cmd_id ) .. " bytes=" .. #body ) end
-    http.Post( CFG.base_url .. "/result", JSON_HEADERS, body, function( resp )
-        if CFG.debug then print( "[bridge] /result reply: " .. tostring( resp and #resp or "nil" ) ) end
-    end )
-end
-
-local function process_batch( response )
-    if type( response ) ~= "string" or response == "" then return end
-    local ok, cmds = pcall( json.decode, response )
-    if not ok or type( cmds ) ~= "table" then
-        if CFG.debug then print( "[bridge] bad response: " .. tostring( cmds ):sub( 1, 80 ) ) end
-        return
-    end
-    if #cmds > 0 and CFG.debug then print( "[bridge] got " .. #cmds .. " cmd(s)" ) end
-    for _, cmd in ipairs( cmds ) do
-        if type( cmd ) == "table" and cmd.id and cmd.op then
-            if CFG.debug then print( "[bridge] dispatch op=" .. cmd.op .. " id=" .. cmd.id ) end
-            local result, err = dispatch( cmd.op, cmd.args )
-            send_result( cmd.id, result, err )
-        end
-    end
-end
-
-local function poll()
-    local now = utility.GetTickCount()
-    if in_flight then
-        if now - inflight_at > CFG.inflight_ttl_ms then
-            if CFG.debug then print( "[bridge] watchdog: reset in_flight after " ..
-                ( now - inflight_at ) .. "ms" ) end
-            in_flight = false
-        else
-            return
-        end
-    end
-    in_flight   = true
-    inflight_at = now
-    poll_count  = poll_count + 1
-    if CFG.debug and poll_count % 50 == 1 then
-        print( "[bridge] poll #" .. poll_count .. " replies=" .. reply_count )
-    end
-    http.Get( CFG.base_url .. "/poll", JSON_HEADERS, function( response )
-        reply_count = reply_count + 1
-        in_flight   = false
-        local ok, perr = pcall( process_batch, response )
-        if not ok then print( "[bridge] process error: " .. tostring( perr ) ) end
-    end )
+    pcall( function() file.write( RESULT_FILE, body ) end )
+    if CFG.debug then print( "[bridge] result id=" .. tostring( cmd_id ) .. " bytes=" .. #body ) end
 end
 
 cheat.register( "onUpdate", function()
-    local now = utility.GetTickCount()
-    if now - last_tick >= CFG.poll_interval_ms then
-        last_tick = now
-        poll()
+    if exec_busy then return end
+
+    local raw = file.read( CMD_FILE )
+    if not raw or raw == "" then return end
+
+    local ok, cmd = pcall( json.decode, raw )
+    if not ok or type( cmd ) ~= "table" or not cmd.id or not cmd.op then
+        pcall( function() file.delete( CMD_FILE ) end )
+        return
     end
+    if cmd.id == last_done then return end
+
+    pcall( function() file.delete( CMD_FILE ) end )
+    exec_busy  = true
+    exec_count = exec_count + 1
+    if CFG.debug then print( "[bridge] exec op=" .. cmd.op .. " id=" .. cmd.id ) end
+
+    local okd, result, err = pcall( dispatch, cmd.op, cmd.args )
+    if okd then
+        write_result( cmd.id, result, err )
+    else
+        write_result( cmd.id, nil, "handler crash: " .. tostring( result ) )
+    end
+    last_done = cmd.id
+    exec_busy = false
 end )
 
 cheat.register( "shutdown", function()
     handles        = {}
     handle_counter = 0
+    pcall( function() file.delete( CMD_FILE ) end )
 end )
 
-print( "[serotonin-bridge v2] loaded, polling " .. CFG.base_url .. " every " .. CFG.poll_interval_ms .. " ms" )
-print( "[serotonin-bridge v2] ops: ping eval inspect safe_inspect snapshot dive live_dump class_counts list_scripts search" )
+print( "[serotonin-bridge v3] file-IPC loaded — agent/cmd.json <-> agent/result.json (menu-independent)" )
+print( "[serotonin-bridge v3] ops: ping eval inspect safe_inspect snapshot dive live_dump class_counts list_scripts search" )

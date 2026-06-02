@@ -1,16 +1,20 @@
 {
-    "version": 2,
+    "version": 1,
     "paths": [
         "game.DataModel",
         "game.PlaceID",
         "game.GetFFlag",
-        "game.SetFFlag"
+        "game.SetFFlag",
+        "game.Workspace.Food",
+        "game.Workspace.Debris",
+        "game.Workspace.Destructibles",
+        "game.Workspace.SpawnedVehicles.DONOT"
     ],
     "dive_depth_limits": [
         {
             "prefix": "game.Workspace.Live.",
             "max_depth": 1,
-            "reason": "deep dive into Live.<player> may crash on some builds"
+            "reason": "Motor6D/Humanoid chain crashes deep dive (2026-04-17)"
         }
     ],
     "eval_code_blocked": [
@@ -21,22 +25,166 @@
         ":GetFFlag\\s*\\(",
         ":SetFFlag\\s*\\(",
         "\\b_G\\b",
-        "LocalPlayer\\s*\\.\\s*(Backpack|PlayerGui|PlayerScripts|StarterGear|AccountAge|FollowUserId|DevEnableMouseLock|DevCameraOcclusionMode|DevComputerCameraMode|DevComputerMovementMode|DevTouchCameraMode|DevTouchMovementMode|CameraMode|CameraMinZoomDistance|AutoJumpEnabled|HealthDisplayDistance|NameDisplayDistance|Chat|ChatMode|OsPlatform|LocaleId|GameplayPaused|VRDevice|MembershipType|ReplicationFocus|SimulationRadius)",
-        ":ToHSV\\s*\\(",
-        "audio\\s*\\.\\s*PlaySound\\s*\\(\\s*[\"'][^\"']{0,10}[\"']",
-        "audio\\.PlaySound\\s*\\(\\s*nil",
-        "cheat\\s*\\.\\s*[Ll]oadString\\s*\\("
+        "LocalPlayer\\s*\\.\\s*(Backpack|PlayerGui|PlayerScripts|StarterGear|AccountAge|FollowUserId|DevEnableMouseLock|DevCameraOcclusionMode|DevComputerCameraMode|DevComputerMovementMode|DevTouchCameraMode|DevTouchMovementMode|CameraMode|CameraMinZoomDistance|AutoJumpEnabled|HealthDisplayDistance|NameDisplayDistance|Chat|ChatMode|OsPlatform|LocaleId|GameplayPaused|VRDevice|MembershipType|ReplicationFocus|SimulationRadius)"
     ],
     "history": [
         {
-            "added": "2026-04",
-            "rule": "audio\\.PlaySound\\s*\\(\\s*[\"'][^\"']{0,10}[\"']",
-            "reason": "audio.PlaySound with any non-WAV string (verified with '', 'not-wav', 'x') triggers a native SEH crash. The internal WAV loader does not validate the RIFF header before walking it."
+            "timestamp": "2026-04-17T23:05:10+00:00",
+            "op": "eval",
+            "args": {
+                "code": "local ok, v = pcall(function() return type(_G) end); return { ok=ok, val=tostring(v) }"
+            },
+            "note": "_G access crashes cheat even inside pcall+type. Native exception not catchable from Lua."
         },
         {
-            "added": "2026-04",
-            "rule": "cheat\\.LoadString\\s*\\(",
-            "reason": "cheat.LoadString raises 'C++ exception' for every 2-arg invocation we tried in build version-2e6461290a3541f5, including syntactically valid Lua. Use the Lua-standard `loadstring`/`load` instead."
+            "timestamp": "2026-04-17T23:10:29+00:00",
+            "op": "eval",
+            "args": {
+                "code": "return tostring(game.LocalPlayer.Backpack)"
+            },
+            "note": "probe.py auto-report on localplayer/Backpack"
+        },
+        {
+            "timestamp": "2026-04-17T23:27:06+00:00",
+            "op": "eval",
+            "args": {
+                "code": "local h,s,v=Color3.fromRGB(255,0,0):ToHSV(); return string.format('%.2f,%.2f,%.2f', h, s, v)"
+            },
+            "note": "probe_docs.py crashed on color3/ToHSV"
+        },
+        {
+            "timestamp": "2026-04-18T00:40:57+00:00",
+            "op": "safe_inspect",
+            "args": {
+                "target": "game.Workspace.Food"
+            },
+            "note": "SEH на safe_inspect Food folder (UGC hub game, Tank FFA)"
+        },
+        {
+            "timestamp": "2026-04-18T12:00:00+00:00",
+            "op": "parallel_batch",
+            "args": {
+                "ops": [
+                    "search Characters Tool",
+                    "safe_inspect h10 StarterCharacter",
+                    "eval LocalPlayer fields"
+                ]
+            },
+            "note": "AR2: три параллельных exec в одном batch (search+safe_inspect+eval) повесили bridge (2 queued), чит упал. Non-thread-safe runtime — всегда serialize eval/search/safe_inspect."
+        },
+        {
+            "timestamp": "2026-04-19T16:39:43+00:00",
+            "op": "ping",
+            "args": {},
+            "note": "auto-blacklisted after repeat timeout"
+        },
+        {
+            "timestamp": "2026-04-19T16:48:24+00:00",
+            "op": "ping",
+            "args": {},
+            "note": "auto-blacklisted after repeat timeout"
+        },
+        {
+            "timestamp": "2026-04-19T16:57:47+00:00",
+            "op": "ping",
+            "args": {},
+            "note": "auto-blacklisted after repeat timeout"
+        },
+        {
+            "timestamp": "2026-04-19T17:30:00+00:00",
+            "op": "eval",
+            "args": {
+                "code": "while (utility.GetTickCount() - t0) < 500 do end"
+            },
+            "note": "TSB: busy-loop в eval блокирует Lua runtime на N миллисекунд → bridge poll timeout > 10s → cheat hangs/crashes. ЗАПРЕЩЕНО использовать busy-wait/sleep loops в eval. Время-разделённые тесты делать через два отдельных eval с sleep на стороне Python."
+        },
+        {
+            "timestamp": "2026-04-19T17:35:00+00:00",
+            "op": "eval",
+            "args": {
+                "code": "m:SetAttribute(\"TSB_TEST\", 12345)"
+            },
+            "note": "TSB: ЛЮБОЙ :SetAttribute вызов на player Model в Live папке КРАШИТ ЧИТ. Anti-tamper в TSB ловит SetAttribute calls. ЗАПРЕЩЕНО использовать SetAttribute в TSB вообще (через eval ИЛИ через onUpdate handlers). Все combat-cheats через атрибуты (Auto-M1/Combo lock/Sprint/Dash/Block/Anti-stagger/etc) НЕВОЗМОЖНЫ. Оставлять только Part.Size writes (работают) + read-only attribute getters."
+        },
+        {
+            "timestamp": "2026-04-19T18:00:00+00:00",
+            "op": "eval",
+            "args": {
+                "code": "game.Workspace:GetChildren()"
+            },
+            "note": "Unknown Wanted/bounty game (Dahood/MadCity-like): даже простой Workspace:GetChildren() КРАШИТ ИГРУ (не только чит, а Roblox process). Крайне агрессивный anti-cheat/anti-exploit. Перед любым probe в новой игре СНАЧАЛА спросить у пользователя название игры — если это Dahood/MadCity/Jailbreak или подобное, Serotonin eval просто не работает без hookmetamethod, который недоступен."
+        },
+        {
+            "timestamp": "2026-04-27T01:29:21+00:00",
+            "op": "ping",
+            "args": {},
+            "note": "auto-blacklisted after repeat timeout"
+        },
+        {
+            "timestamp": "2026-04-27T03:33:59+00:00",
+            "op": "ping",
+            "args": {},
+            "note": "auto-blacklisted after repeat timeout"
+        },
+        {
+            "timestamp": "2026-04-27T20:32:12+00:00",
+            "op": "ping",
+            "args": {},
+            "note": "auto-blacklisted after repeat timeout"
+        },
+        {
+            "timestamp": "2026-04-27T20:32:28+00:00",
+            "op": "ping",
+            "args": {},
+            "note": "auto-blacklisted after repeat timeout"
+        },
+        {
+            "timestamp": "2026-05-08T04:17:30+00:00",
+            "op": "ping",
+            "args": {},
+            "note": "auto-blacklisted after repeat timeout"
+        },
+        {
+            "timestamp": "2026-05-08T04:25:50+00:00",
+            "op": "ping",
+            "args": {},
+            "note": "auto-blacklisted after repeat timeout"
+        },
+        {
+            "timestamp": "2026-05-08T09:47:04+00:00",
+            "op": "ping",
+            "args": {},
+            "note": "auto-blacklisted after repeat timeout"
+        },
+        {
+            "timestamp": "2026-05-08T09:50:02+00:00",
+            "op": "ping",
+            "args": {},
+            "note": "auto-blacklisted after repeat timeout"
+        },
+        {
+            "timestamp": "2026-05-08T09:59:36+00:00",
+            "op": "ping",
+            "args": {},
+            "note": "auto-blacklisted after repeat timeout"
+        },
+        {
+            "timestamp": "2026-05-08T10:09:48+00:00",
+            "op": "ping",
+            "args": {},
+            "note": "auto-blacklisted after repeat timeout"
+        },
+        {
+            "timestamp": "2026-06-02T18:13:27+00:00",
+            "op": "ping",
+            "args": {},
+            "note": "auto-blacklisted after repeat timeout"
+        },
+        {
+            "timestamp": "2026-06-02T18:18:17+00:00",
+            "op": "ping",
+            "args": {},
+            "note": "auto-blacklisted after repeat timeout"
         }
     ]
 }

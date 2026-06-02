@@ -29,6 +29,11 @@ HTTP_PORT          = 8765
 POLL_HOLD_SECONDS  = 9.0
 DEFAULT_TIMEOUT    = 10.0
 
+AGENT_DIR   = r"C:\Serotonin\files\agent"
+CMD_FILE    = os.path.join(AGENT_DIR, "cmd.json")
+RESULT_FILE = os.path.join(AGENT_DIR, "result.json")
+FILE_POLL   = 0.05
+
 BLACKLIST_PATH = Path(__file__).with_name("crash_blacklist.json")
 
 DEFAULT_BLACKLIST: dict[str, Any] = {
@@ -60,7 +65,6 @@ def load_blacklist() -> dict[str, Any]:
         return dict(DEFAULT_BLACKLIST)
     try:
         data = json.loads(BLACKLIST_PATH.read_text(encoding="utf-8"))
-
         for k, v in DEFAULT_BLACKLIST.items():
             data.setdefault(k, v)
         return data
@@ -116,25 +120,114 @@ pending:   dict[str, asyncio.Future] = {}
 
 _bridge_sem: asyncio.Semaphore | None = None
 
+_recent_timeouts: dict[str, int] = {}
+AUTO_BL_THRESHOLD = 2
+
 def _sem() -> asyncio.Semaphore:
     global _bridge_sem
     if _bridge_sem is None:
         _bridge_sem = asyncio.Semaphore(1)
     return _bridge_sem
 
+def _op_signature(op: str, args: dict | None) -> str:
+    try:
+        payload = json.dumps({"op": op, "args": args or {}}, sort_keys=True, default=str)
+    except Exception:
+        payload = f"{op}:{args!r}"
+    return payload[:200]
+
+def _auto_blacklist_on_repeat_timeout(op: str, args: dict | None) -> str | None:
+    sig = _op_signature(op, args)
+    count = _recent_timeouts.get(sig, 0) + 1
+    _recent_timeouts[sig] = count
+    if count < AUTO_BL_THRESHOLD:
+        return None
+    _recent_timeouts.pop(sig, None)
+
+    a = args or {}
+    added: list[str] = []
+    if op in ("inspect", "safe_inspect", "dive") and isinstance(a.get("target"), str):
+        tgt = a["target"]
+        if tgt not in BL.get("paths", []):
+            BL.setdefault("paths", []).append(tgt)
+            added.append(f"paths: {tgt}")
+    if op == "dive" and isinstance(a.get("root"), str):
+        root = a["root"]
+        if root not in BL.get("paths", []):
+            BL.setdefault("paths", []).append(root)
+            added.append(f"paths: {root}")
+    if op == "eval" and isinstance(a.get("code"), str):
+        code = a["code"].strip()
+        m = re.search(r"game\s*\.[\w\.]+", code)
+        if m:
+            path = m.group(0)
+            if path not in BL.get("paths", []):
+                BL.setdefault("paths", []).append(path)
+                added.append(f"paths (from eval): {path}")
+
+    BL.setdefault("history", []).append({
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "op": op, "args": a, "note": "auto-blacklisted after repeat timeout",
+    })
+    BL["history"] = BL["history"][-50:]
+    save_blacklist()
+    if added:
+        log.warning("auto-blacklist after repeat timeout: %s", ", ".join(added))
+        return ", ".join(added)
+    return None
+
 async def bridge_call(op: str, args: dict | None = None, timeout: float = DEFAULT_TIMEOUT) -> Any:
     async with _sem():
         cmd_id = uuid.uuid4().hex
-        fut = asyncio.get_running_loop().create_future()
-        pending[cmd_id] = fut
-        await cmd_queue.put({"id": cmd_id, "op": op, "args": args or {}})
+        os.makedirs(AGENT_DIR, exist_ok=True)
         try:
-            return await asyncio.wait_for(fut, timeout=timeout)
-        except asyncio.TimeoutError:
-            pending.pop(cmd_id, None)
-            raise RuntimeError(
-                f"Bridge timeout after {timeout}s. Load bridge.lua in Serotonin Scripting tab."
-            )
+            os.remove(RESULT_FILE)
+        except FileNotFoundError:
+            pass
+
+        payload = json.dumps({"id": cmd_id, "op": op, "args": args or {}})
+        tmp = CMD_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(payload)
+        os.replace(tmp, CMD_FILE)
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while loop.time() < deadline:
+            await asyncio.sleep(FILE_POLL)
+            try:
+                with open(RESULT_FILE, "r", encoding="utf-8") as f:
+                    raw = f.read()
+            except FileNotFoundError:
+                continue
+            if not raw:
+                continue
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if data.get("id") != cmd_id:
+                continue
+            try:
+                os.remove(RESULT_FILE)
+            except FileNotFoundError:
+                pass
+            _recent_timeouts.pop(_op_signature(op, args), None)
+            err = data.get("error")
+            if err:
+                raise RuntimeError(str(err))
+            return data.get("result")
+
+        try:
+            os.remove(CMD_FILE)
+        except FileNotFoundError:
+            pass
+        auto = _auto_blacklist_on_repeat_timeout(op, args)
+        extra = f" Auto-blacklisted: {auto}." if auto else ""
+        raise RuntimeError(
+            f"Bridge timeout after {timeout}s. Load bridge.lua in Serotonin Scripting tab "
+            f"(menu can be closed).{extra}"
+        )
 
 def _lua_literal(v: Any) -> str:
     if v is None:               return "nil"
@@ -144,11 +237,18 @@ def _lua_literal(v: Any) -> str:
     raise TypeError(f"cannot encode {type(v).__name__} as Lua literal")
 
 async def http_poll(request: web.Request) -> web.Response:
-    try:
-        cmd = await asyncio.wait_for(cmd_queue.get(), timeout=POLL_HOLD_SECONDS)
-    except asyncio.TimeoutError:
-        return web.json_response([])
-    return web.json_response([cmd])
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + POLL_HOLD_SECONDS
+    while True:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return web.json_response([])
+        try:
+            cmd = await asyncio.wait_for(cmd_queue.get(), timeout=remaining)
+        except asyncio.TimeoutError:
+            return web.json_response([])
+        if cmd.get("id") in pending:
+            return web.json_response([cmd])
 
 async def http_result(request: web.Request) -> web.Response:
     try:
@@ -629,127 +729,6 @@ TOOLS: list[types.Tool] = [
         inputSchema={"type": "object", "properties": {}},
     ),
 
-    # ---- file ops (cheat sandbox at C:\Serotonin\files) -----------------
-    types.Tool(
-        name="serotonin_file_read",
-        description="file.read(path). Returns the file contents as a string, or null if missing. Path resolves under the cheat sandbox unless absolute.",
-        inputSchema={
-            "type": "object",
-            "properties": { "path": {"type": "string"} },
-            "required": ["path"],
-        },
-    ),
-    types.Tool(
-        name="serotonin_file_write",
-        description="file.write(path, content). Overwrites the file. Returns true on success, false if the parent directory is missing. Use serotonin_file_mkdir first for nested paths.",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "path":    {"type": "string"},
-                "content": {"type": "string"},
-                "append":  {"type": "boolean", "default": False, "description": "use file.append instead of file.write (creates the file if missing)"},
-            },
-            "required": ["path", "content"],
-        },
-    ),
-    types.Tool(
-        name="serotonin_file_listdir",
-        description="file.listdir(path). Returns an array of {name, isDirectory, isFile, size?} records, or null for a missing directory. Pass empty string for the sandbox root.",
-        inputSchema={
-            "type": "object",
-            "properties": { "path": {"type": "string", "default": ""} },
-        },
-    ),
-    types.Tool(
-        name="serotonin_file_op",
-        description="One-shot file metadata op: 'exists' / 'isdir' / 'mkdir' (recursive) / 'delete'. Returns the boolean result of the underlying call.",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "op":   {"type": "string", "enum": ["exists", "isdir", "mkdir", "delete"]},
-                "path": {"type": "string"},
-            },
-            "required": ["op", "path"],
-        },
-    ),
-
-    # ---- memory.Scan -----------------------------------------------------
-    types.Tool(
-        name="serotonin_memory_scan",
-        description="memory.Scan(pattern, [module]). Pattern is a hex AOB with '??' wildcards. With one arg returns the first absolute address as a number or nil. With a module string returns an array of all matches inside that module.",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "pattern": {"type": "string", "description": "AOB pattern, e.g. '48 89 5C 24 ??'"},
-                "module":  {"type": "string", "description": "optional, e.g. 'RobloxPlayerBeta.exe'"},
-                "limit":   {"type": "integer", "default": 100, "description": "max addresses to return for the table form"},
-            },
-            "required": ["pattern"],
-        },
-    ),
-    types.Tool(
-        name="serotonin_memory_is_valid",
-        description="memory.IsValid(address). Returns true if the virtual address is inside a readable page in the Roblox process.",
-        inputSchema={
-            "type": "object",
-            "properties": { "address": {"type": "integer"} },
-            "required": ["address"],
-        },
-    ),
-
-    # ---- audio.Beep (safe), audio.StopAll --------------------------------
-    types.Tool(
-        name="serotonin_audio_beep",
-        description="audio.Beep(freq_hz, duration_ms). Plays a system beep. Synchronous, blocks for duration_ms. PlaySound is intentionally not exposed because non-WAV input crashes the cheat.",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "freq_hz":     {"type": "integer", "minimum": 1, "maximum": 32000},
-                "duration_ms": {"type": "integer", "minimum": 1, "maximum": 5000},
-            },
-            "required": ["freq_hz", "duration_ms"],
-        },
-    ),
-    types.Tool(
-        name="serotonin_audio_stop_all",
-        description="audio.StopAll(). Silences every playing sound. Safe no-op when nothing is playing.",
-        inputSchema={"type": "object", "properties": {}},
-    ),
-
-    # ---- ui state read/write ---------------------------------------------
-    types.Tool(
-        name="serotonin_ui_get_value",
-        description="ui.GetValue(tab, container, label). Reads a widget's current value. Return type depends on the widget kind (bool / number / string / table).",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "tab":       {"type": "string"},
-                "container": {"type": "string"},
-                "label":     {"type": "string"},
-            },
-            "required": ["tab", "container", "label"],
-        },
-    ),
-    types.Tool(
-        name="serotonin_ui_set_value",
-        description=(
-            "ui.SetValue(tab, container, label, value). Value type must match the widget. "
-            "Pass JSON for table values: Multiselect={'1':true,'2':false,...}, "
-            "Colorpicker={'r':R,'g':G,'b':B,'a':A}, Hotkey=number (Windows VK code), "
-            "Dropdown/Listbox=number (1-based index)."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "tab":       {"type": "string"},
-                "container": {"type": "string"},
-                "label":     {"type": "string"},
-                "value":     {},
-            },
-            "required": ["tab", "container", "label", "value"],
-        },
-    ),
-
 ]
 
 @app.list_tools()
@@ -789,32 +768,12 @@ async def _dispatch(name: str, a: dict) -> Any:
         class_name  = a.get("class_name")
         root        = a.get("root", "game")
         max_results = int(a.get("max_results", 100))
-        code = f"""
-local root_val = {root}
-if root_val == nil then error("root resolves to nil: {root}") end
-local pat = string.lower({json.dumps(pattern)})
-local cls_filter = {_lua_literal(class_name)}
-local mx = {max_results}
-local descendants = root_val:GetDescendants()
-local out = {{}}
-for i = 1, #descendants do
-    if #out >= mx then break end
-    local inst = descendants[i]
-    local ok_n, nm = pcall(function() return inst.Name end)
-    if ok_n and type(nm) == "string" then
-        if pat == "" or string.find(string.lower(nm), pat, 1, true) then
-            if cls_filter then
-                local ok_c, cl = pcall(function() return inst.ClassName end)
-                if ok_c and cl == cls_filter then out[#out+1] = inst end
-            else
-                out[#out+1] = inst
-            end
-        end
-    end
-end
-return out
-"""
-        return await bridge_call("eval", {"code": code, "maxdepth": 2})
+        return await bridge_call("search", {
+            "pattern":     pattern,
+            "class_name":  class_name,
+            "root":        root,
+            "max_results": max_results,
+        })
 
     if name == "serotonin_tree":
         root         = a.get("root", "game.Workspace")
@@ -1143,68 +1102,6 @@ return {
 """
         return await bridge_call("eval", {"code": code, "maxdepth": 2})
 
-    if name == "serotonin_file_read":
-        code = f"return file.read({json.dumps(a['path'])})"
-        return await bridge_call("eval", {"code": code})
-
-    if name == "serotonin_file_write":
-        fn = "append" if a.get("append") else "write"
-        code = f"return file.{fn}({json.dumps(a['path'])}, {json.dumps(a['content'])})"
-        return await bridge_call("eval", {"code": code})
-
-    if name == "serotonin_file_listdir":
-        path = a.get("path", "")
-        code = f"return file.listdir({json.dumps(path)})"
-        return await bridge_call("eval", {"code": code, "maxdepth": 3})
-
-    if name == "serotonin_file_op":
-        op   = a["op"]
-        path = a["path"]
-        code = f"return file.{op}({json.dumps(path)})"
-        return await bridge_call("eval", {"code": code})
-
-    if name == "serotonin_memory_scan":
-        pattern = a["pattern"]
-        module  = a.get("module")
-        limit   = int(a.get("limit", 100))
-        if module:
-            code = f"""
-local hits = memory.Scan({json.dumps(pattern)}, {json.dumps(module)})
-if type(hits) ~= "table" then return hits end
-local out = {{}}
-for i = 1, math.min({limit}, #hits) do out[i] = hits[i] end
-return {{ count = #hits, addresses = out }}
-"""
-        else:
-            code = f"return memory.Scan({json.dumps(pattern)})"
-        return await bridge_call("eval", {"code": code, "maxdepth": 2})
-
-    if name == "serotonin_memory_is_valid":
-        addr = int(a["address"])
-        code = f"return memory.IsValid({addr})"
-        return await bridge_call("eval", {"code": code})
-
-    if name == "serotonin_audio_beep":
-        freq = int(a["freq_hz"])
-        dur  = int(a["duration_ms"])
-        code = f"audio.Beep({freq}, {dur}) return true"
-        return await bridge_call("eval", {"code": code, "timeout": dur / 1000.0 + 5})
-
-    if name == "serotonin_audio_stop_all":
-        return await bridge_call("eval", {"code": "audio.StopAll() return true"})
-
-    if name == "serotonin_ui_get_value":
-        code = f"return ui.GetValue({json.dumps(a['tab'])}, {json.dumps(a['container'])}, {json.dumps(a['label'])})"
-        return await bridge_call("eval", {"code": code, "maxdepth": 3})
-
-    if name == "serotonin_ui_set_value":
-        value_lua = _lua_literal(a["value"])
-        code = (
-            f"ui.SetValue({json.dumps(a['tab'])}, {json.dumps(a['container'])}, "
-            f"{json.dumps(a['label'])}, {value_lua}) return true"
-        )
-        return await bridge_call("eval", {"code": code})
-
     raise RuntimeError(f"unknown tool: {name}")
 
 async def start_http_server() -> web.AppRunner:
@@ -1237,6 +1134,13 @@ async def main() -> None:
         len(BL.get("eval_code_blocked", [])),
         len(BL.get("history", [])),
     )
+    os.makedirs(AGENT_DIR, exist_ok=True)
+    for _f in (CMD_FILE, RESULT_FILE):
+        try:
+            os.remove(_f)
+        except FileNotFoundError:
+            pass
+    log.info("file-IPC ready: %s", AGENT_DIR)
     runner = await start_http_server()
     try:
         if os.environ.get("SEROTONIN_HTTP_ONLY") == "1":
