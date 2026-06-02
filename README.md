@@ -1,7 +1,7 @@
 # mcp-serotonin
 
 ## What is this
-Tired of writing ESP blind, guessing whether `entity.GetParts` works in this mode, or watching the c4eat crash because `game.PlaceID` is apparently cursed?
+Tired of writing ESP blind, guessing whether `entity.GetParts` works in this mode, or watching the Cheat crash because `game.PlaceID` is apparently cursed?
 
 This is an MCP server that bridges any MCP-capable LLM agent (Claude Code, Cursor, Cline, Continue…) to the Serotonin Lua runtime. The agent **sees the live game** - walks the Workspace tree, reads bones and positions, projects world coords to screen, reads memory - then writes Lua tailored to your mode instead of generic templates.
 
@@ -15,7 +15,7 @@ Roblox Studio     - can't attach to a live public server, only your own place fi
 Ghidra / x64dbg   - see bytes, not game objects; reverse the whole tree before asking
                     "who's alive?"
 
-C4eatEngine       - scans values, can't walk the instance graph or draw overlays
+CheatEngine       - scans values, can't walk the instance graph or draw overlays
 
 Script executors  - give you Lua, but you write blind and retry on crash
 ```
@@ -29,13 +29,13 @@ MCP client  <-- stdio -->  server.py  <-- files -->  bridge.lua  <-->  Serotonin
                                        agent/result.json
 ```
 
-`server.py` writes the next command to `C:\Serotonin\files\agent\cmd.json` (atomically - temp + replace), `bridge.lua` reads it on its `onUpdate` frame, runs it on the game thread, serializes the result (Instances become handles you can pass back; Vector3/Color3 keep their types) and writes `agent/result.json`. One command at a time, serialized end-to-end - parallel evals stacking inside Serotonin crash the c4eat reliably. No sockets and no async HTTP callbacks: Serotonin only pumps HTTP callbacks while the menu renders, so the old transport stalled with the menu closed; synchronous file IO on `onUpdate` does not.
+`server.py` writes the next command to `C:\Serotonin\files\agent\cmd.json` (atomically - temp + replace), `bridge.lua` reads it on its `onUpdate` frame, runs it on the game thread, serializes the result (Instances become handles you can pass back; Vector3/Color3 keep their types) and writes `agent/result.json`. One command at a time, serialized end-to-end - parallel evals stacking inside Serotonin crash the Cheat reliably. No sockets and no async HTTP callbacks: Serotonin only pumps HTTP callbacks while the menu renders, so the old transport stalled with the menu closed; synchronous file IO on `onUpdate` does not.
 
 ## Crash protection
 
-Some Lua expressions in Serotonin trigger native C++ exceptions that `pcall` can't catch - they kill the c4eat DLL. Reading `_G`, `game.DataModel`, `game.PlaceID`, `game.LocalPlayer.Backpack`, calling `Color3:ToHSV()` - all confirmed crashers. This release ships with:
+Some Lua expressions in Serotonin trigger native C++ exceptions that `pcall` can't catch - they kill the Cheat DLL. Reading `_G`, `game.DataModel`, `game.PlaceID`, `game.LocalPlayer.Backpack`, calling `Color3:ToHSV()` - all confirmed crashers. This release ships with:
 
-- A **safe-mode pre-flight** in `server.py` that checks every op against `crash_blacklist.json` before it leaves the Python process. In safe mode (default: on) blocked ops never reach the c4eat.
+- A **safe-mode pre-flight** in `server.py` that checks every op against `crash_blacklist.json` before it leaves the Python process. In safe mode (default: on) blocked ops never reach the Cheat.
 - A **class-based property allowlist** in `bridge.lua` - only documented properties are read via `safe_inspect` / `dive`. Undocumented fields are a known crash vector (Serotonin's proxy tries to resolve them via raw memory and faults on unknown offsets).
 - A **per-op read/time budget** plus a `HEAVY_SKIP` subtree list, so a tree walk never materialises the whole `GetDescendants` graph in one native call (the old AV / frame-stall path on big trees).
 - A **`/crash_report` endpoint** that auto-extracts blacklist rules when you feed it the last-known-bad op. Learn once, never repeat.
@@ -92,7 +92,7 @@ Put it wherever your client expects it (project-local `.mcp.json`, user-level co
 3. Start your MCP client - it'll spawn `server.py` over stdio on demand.
 4. Call `serotonin_ping`. If you get `"pong"`, you're done. **The Serotonin menu can stay closed** - the bridge runs off `onUpdate`, not the menu render loop.
 
-If it times out, the bridge isn't loaded. Reload the Lua script and check the c4eat console for errors.
+If it times out, the bridge isn't loaded. Reload the Lua script and check the Cheat console for errors.
 
 ## Tools (31 wrappers)
 
@@ -101,7 +101,7 @@ If it times out, the bridge isn't loaded. Reload the Lua script and check the c4
 | Tool | What it does |
 |---|---|
 | `serotonin_ping` | Liveness check. |
-| `serotonin_eval` | Run arbitrary Lua. Instances / Vector3 / Color3 get serialized automatically. Blocked patterns don't reach the c4eat in safe mode. |
+| `serotonin_eval` | Run arbitrary Lua. Instances / Vector3 / Color3 get serialized automatically. Blocked patterns don't reach the Cheat in safe mode. |
 | `serotonin_inspect` | Properties, Attributes, Children for one Instance. Takes a dot-path or a handle. |
 | `serotonin_search_instances` | Walk descendants with Name substring + optional ClassName filter (bounded, skips crash-prone subtrees). |
 | `serotonin_tree` | Recursive Name/ClassName dump up to N levels. |
@@ -155,9 +155,9 @@ If it times out, the bridge isn't loaded. Reload the Lua script and check the c4
 | `serotonin_audio_beep` | `audio.Beep(freq, ms)`. Synchronous, blocks for `ms`. |
 | `serotonin_audio_stop_all` | `audio.StopAll()`. Silences every playing sound. |
 
-`audio.PlaySound` is intentionally **not** wrapped because non-WAV input crashes the c4eat with a native SEH exception. Drive `PlaySound` through `serotonin_eval` only when you control the bytes (e.g. `file.read` of a known-good `.wav`).
+`audio.PlaySound` is intentionally **not** wrapped because non-WAV input crashes the Cheat with a native SEH exception. Drive `PlaySound` through `serotonin_eval` only when you control the bytes (e.g. `file.read` of a known-good `.wav`).
 
-### UI (drive the c4eat menu)
+### UI (drive the Cheat menu)
 
 | Tool | What it does |
 |---|---|
@@ -218,7 +218,7 @@ Tunables in `bridge.lua` (top of file, `CFG` table):
 - `op_budget_max` - max native property reads per op before a walk aborts with partial data (default 15000)
 - `op_time_max_ms` - soft per-op deadline (default 8000)
 - `max_depth` - default serialization depth (default 3)
-- `debug` - print per-command lines to the c4eat console
+- `debug` - print per-command lines to the Cheat console
 
 ## Credits
 
