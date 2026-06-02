@@ -555,7 +555,14 @@ local function op_eval( args )
     if not chunk then return nil, "parse: " .. tostring( err ) end
     local ok, result = pcall( chunk )
     if not ok then return nil, "runtime: " .. tostring( result ) end
-    return serialize( result, 0 )
+    local saved = CFG.max_depth
+    if type( args.maxdepth ) == "number" and args.maxdepth > 0 then
+        CFG.max_depth = math.min( args.maxdepth, 8 )
+    end
+    local ok2, out = pcall( serialize, result, 0 )
+    CFG.max_depth = saved
+    if not ok2 then return nil, "serialize: " .. tostring( out ) end
+    return out
 end
 
 local function op_safe_inspect( args )
@@ -1045,5 +1052,5 @@ cheat.register( "shutdown", function()
     pcall( function() file.delete( CMD_FILE ) end )
 end )
 
-print( "[serotonin-bridge v3] file-IPC loaded — agent/cmd.json <-> agent/result.json (menu-independent)" )
+print( "[serotonin-bridge v3] file-IPC loaded - agent/cmd.json <-> agent/result.json (menu-independent)" )
 print( "[serotonin-bridge v3] ops: ping eval inspect safe_inspect snapshot dive live_dump class_counts list_scripts search" )

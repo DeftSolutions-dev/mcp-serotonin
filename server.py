@@ -477,7 +477,7 @@ TOOLS: list[types.Tool] = [
     types.Tool(
         name="serotonin_parts_count",
         description=(
-            "Return entity.GetPartsCount() — total number of cached parts. "
+            "Return entity.GetPartsCount() - total number of cached parts. "
             "Cheap call, useful before deciding to enumerate via list_parts."
         ),
         inputSchema={"type": "object", "properties": {}},
@@ -488,7 +488,7 @@ TOOLS: list[types.Tool] = [
             "Full metadata for ONE cached part by its `index` (1-based, from entity.GetParts()). "
             "Returns Position/Size/Rotation + Address/ClassName/Primitive/Color/"
             "Transparency/Shape/MeshId/HasMesh + CubeVertices (8 corners of OBB). "
-            "Each field is captured under pcall — missing methods are silently omitted."
+            "Each field is captured under pcall - missing methods are silently omitted."
         ),
         inputSchema={
             "type": "object",
@@ -550,7 +550,7 @@ TOOLS: list[types.Tool] = [
     ),
     types.Tool(
         name="serotonin_memory_base",
-        description="Return memory.GetBase() — base address of RobloxPlayerBeta.exe.",
+        description="Return memory.GetBase() - base address of RobloxPlayerBeta.exe.",
         inputSchema={"type": "object", "properties": {}},
     ),
 
@@ -648,7 +648,7 @@ TOOLS: list[types.Tool] = [
     types.Tool(
         name="serotonin_project_to_screen",
         description=(
-            "utility.WorldToScreen(Vector3) — project a world position to 2D screen. "
+            "utility.WorldToScreen(Vector3) - project a world position to 2D screen. "
             "Returns {x, y, on_screen}."
         ),
         inputSchema={
@@ -986,7 +986,7 @@ return out
     if name == "serotonin_parts_count":
         code = """
 if type(entity.GetPartsCount) ~= "function" then
-    return { error = "entity.GetPartsCount not available — Roblox/Serotonin update required" }
+    return { error = "entity.GetPartsCount not available - Roblox/Serotonin update required" }
 end
 local ok, n = pcall(entity.GetPartsCount)
 if not ok then return { error = tostring(n) } end
@@ -1284,7 +1284,7 @@ async def main() -> None:
     runner = await start_http_server()
     try:
         if os.environ.get("SEROTONIN_HTTP_ONLY") == "1":
-            log.info("HTTP-only mode — MCP stdio disabled, idling forever")
+            log.info("HTTP-only mode - MCP stdio disabled, idling forever")
             while True:
                 await asyncio.sleep(3600)
         async with stdio_server() as (read_stream, write_stream):
