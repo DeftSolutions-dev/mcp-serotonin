@@ -47,3 +47,7 @@ MCP client  <-- stdio -->  server.py  <-- files -->  bridge.lua  <-->  Serotonin
 - Load `bridge.lua` in the Scripting tab -> call `serotonin_ping` -> `"pong"` (the menu can stay closed)
 
 Repo: https://github.com/DeftSolutions-dev/mcp-serotonin
+
+## Credits
+
+Crash diagnosis and the file-based IPC approach: **[mixercodes](https://github.com/mixercodes)**. His [mcp-serotonin-v2](https://github.com/mixercodes/mcp-serotonin-v2) found the holes and pinned the real root cause - the menu-closed / async HTTP-callback stall - and the file-based transport this v0.3.0 release ships is his approach. The crash fixes here are effectively his findings and implementation ported back into this bridge. Thanks for the help. 🙏
